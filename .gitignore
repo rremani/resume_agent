@@ -1,0 +1,18 @@
+# secrets — never commit
+.env
+
+# generated config (non-secret, but local)
+config.yaml
+
+# python
+__pycache__/
+*.pyc
+
+# generated outputs
+output/*
+!output/.gitkeep
+
+# career data is personal; keep local
+raw/*
+!raw/.gitkeep
+career/**/*.md
