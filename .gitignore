@@ -16,3 +16,4 @@ output/*
 raw/*
 !raw/.gitkeep
 career/**/*.md
+.venv
