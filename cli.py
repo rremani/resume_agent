@@ -12,7 +12,7 @@ First run auto-launches onboarding. Config in config.yaml; API keys read from
 env (ANTHROPIC_API_KEY / OPENROUTER_API_KEY), never stored.
 
 Install the console command with:  pip install -e .   then run `resume ...`
-or just:  python cli.py ...
+or just:  resume ...
 """
 from __future__ import annotations
 import typer
@@ -38,8 +38,10 @@ def _report(res: dict):
         for p in res["problems"]:
             console.print(f"   • {p}")
         console.print("[dim]  Some may be false positives (a metric reworded into words).[/]")
+    if res.get("used_search"):
+        console.print("[cyan]• Explicit search tool researched the target (see RESEARCH CONTEXT).[/]")
     if res.get("used_web"):
-        console.print("[cyan]• Web search was used to research the brief.[/]")
+        console.print("[cyan]• Provider built-in web search was used.[/]")
 
     t = Table(show_header=False, box=None, pad_edge=False)
     t.add_row("[bold]YAML[/]", res["yaml"])
@@ -49,7 +51,38 @@ def _report(res: dict):
     console.print(t)
 
 
-def _run(mode: str, brief: str, out: str | None):
+def _check_staleness(cfg, provider, auto: bool):
+    """Warn (or auto-recompile) if raw/ changed since the wiki was last built."""
+    from core import store as _store, compiler
+    if not _store.wiki_is_stale():
+        return
+    c = _store.raw_changes()
+    if not c["has_manifest"]:
+        msg = ("change-tracking not initialized yet for this wiki — run "
+               "[bold]resume recompile[/] once to enable it")
+    else:
+        bits = []
+        for label, key in (("modified", "modified"), ("added", "added"),
+                           ("removed", "removed")):
+            if c[key]:
+                bits.append(f"{len(c[key])} {label}")
+        msg = (f"[yellow]⚠ raw/ changed since last compile[/] ({', '.join(bits)}) "
+               "— the career wiki may be out of date.")
+    if auto:
+        console.print(f"{msg}\n[dim]--auto: recompiling…[/]")
+        m = cfg["modes"]["think"]
+        with console.status("[bold]Recompiling career wiki…[/]", spinner="dots"):
+            res = compiler.compile_wiki(provider, model=m["model"])
+        console.print("[green]✓ wiki recompiled[/]" if res["ok"]
+                      else "[yellow]⚠ recompiled with grounding flags[/]")
+    else:
+        console.print(msg)
+        console.print("[dim]  run [bold]resume recompile[/] to re-sync "
+                      "(or pass [bold]--auto[/] to recompile automatically).[/]\n")
+
+
+def _run(mode: str, brief: str, out: str | None, auto: bool = False,
+         web: bool = False):
     from core import store as _store
     if _store.career_is_empty():
         console.print("[yellow]No career wiki yet.[/] Run "
@@ -59,33 +92,69 @@ def _run(mode: str, brief: str, out: str | None):
     m = cfg["modes"][mode]
     out = out or mode
     provider = make_provider(cfg["provider"])
+
+    _check_staleness(cfg, provider, auto)
+
+    if mode == "think":
+        _run_think(cfg, provider, m, brief, out)
+        return
+
+    # fast: single-shot. --web opts this run into web (provider built-in +
+    # the configured explicit search tool); default stays offline.
+    allow_web = bool(web)
+    search_tool = None
+    if allow_web:
+        from core import search as _search
+        search_tool = _search.from_config(cfg)
+    search_max = ((cfg.get("search") or {}).get("max_results")) or 3
+    search_name = (cfg.get("search") or {}).get("provider") if search_tool else None
+
+    web_label = "[green]on[/]" if allow_web else "[dim]off[/]"
+    search_label = f"[cyan]{search_name}[/]" if search_tool else "[dim]built-in[/]"
     console.print(Panel.fit(
-        f"[bold]{mode}[/]  provider=[cyan]{cfg['provider']}[/]  "
-        f"model=[cyan]{m['model']}[/]  web={'[green]on[/]' if m['allow_web'] else '[dim]off[/]'}",
+        f"[bold]fast[/]  provider=[cyan]{cfg['provider']}[/]  "
+        f"model=[cyan]{m['model']}[/]  web={web_label}  search={search_label}",
         border_style="blue"))
 
-    accumulated = brief or ""
-    if m.get("conversational"):
-        console.print("[dim]Think mode — refine the brief across lines. "
-                      "Type 'go' to generate, 'quit' to abort.[/]\n")
-        if accumulated:
-            console.print(f"[dim]current brief:[/] {accumulated}\n")
-        while True:
-            line = Prompt.ask("[bold cyan]you[/]").strip()
-            if line.lower() in ("go", "generate", ""):
-                if accumulated:
-                    break
-                console.print("[yellow]brief is empty — add something first[/]")
-                continue
-            if line.lower() in ("quit", "exit"):
-                console.print("[dim]aborted.[/]")
-                raise typer.Exit()
-            accumulated = (accumulated + " " + line).strip()
-            console.print(f"[dim]brief is now:[/] {accumulated}\n")
-
     with console.status("[bold]Generating tailored resume…[/]", spinner="dots"):
-        res = agent.run_once(provider, model=m["model"], brief=accumulated,
-                             allow_web=m["allow_web"], out_stem=out)
+        res = agent.run_once(provider, model=m["model"], brief=brief or "",
+                             allow_web=allow_web, out_stem=out,
+                             search_tool=search_tool, search_max_results=search_max)
+    _report(res)
+
+
+def _run_think(cfg, provider, m, brief, out):
+    """LangGraph editor workflow: understand → draft (edit vetted material) →
+    improve loop → finalize (write-back + grounded render)."""
+    from core import think_graph, agent as _agent
+    allow_web = bool(m.get("allow_web", True))
+
+    web_state = "[green]on[/]" if allow_web else "[dim]off[/]"
+    console.print(Panel.fit(
+        f"[bold]think[/]  model=[cyan]{m['model']}[/]  web={web_state}",
+        border_style="blue"))
+    console.print("[dim]It tailors a resume from your verified experience, shows a "
+                  "preview, and refines on your changes.\n"
+                  "Reply with changes · 'done' to generate · 'quit' to abort.[/]\n")
+
+    def ask_fn():
+        return Prompt.ask("[bold cyan]you[/]")
+
+    def say_fn(text):
+        console.print(f"[bold magenta]agent[/]: {text}\n")
+
+    def notify_fn(text):
+        console.print(f"[dim]· {text}[/]")
+
+    def render_fn(data, stem):
+        return _agent.render(data, stem)
+
+    res = think_graph.run_think(
+        cfg, opening=brief or "", out_stem=out, ask_fn=ask_fn, say_fn=say_fn,
+        notify_fn=notify_fn, render_fn=render_fn, allow_web=allow_web)
+    if res.get("aborted"):
+        console.print("[dim]aborted — nothing generated.[/]")
+        raise typer.Exit()
     _report(res)
 
 
@@ -99,19 +168,26 @@ def onboard():
 
 @app.command()
 def fast(brief: str = typer.Argument(..., help="target role / brief text"),
-         out: str = typer.Option(None, "--out", help="output filename stem")):
-    """Quick one-shot: cheap model, no web search, no conversation."""
-    _run("fast", brief, out)
+         out: str = typer.Option(None, "--out", help="output filename stem"),
+         web: bool = typer.Option(False, "--web",
+                                  help="allow web research this run (default offline)"),
+         auto: bool = typer.Option(False, "--auto",
+                                   help="auto-recompile if raw/ changed")):
+    """Quick one-shot: cheap model, single-shot. Offline unless --web."""
+    _run("fast", brief, out, auto, web)
 
 
 @app.command()
 def think(brief: str = typer.Argument("", help="target role / brief text"),
           file: str = typer.Option(None, "--file", help="read brief from a file (JD)"),
-          out: str = typer.Option(None, "--out", help="output filename stem")):
-    """Strong model, web search, conversational refinement."""
+          out: str = typer.Option(None, "--out", help="output filename stem"),
+          auto: bool = typer.Option(False, "--auto",
+                                    help="auto-recompile if raw/ changed")):
+    """Tailors your verified experience to a target: drafts, shows suggestions,
+    refines on your feedback, then writes the grounded resume."""
     if file:
         brief = open(file).read()
-    _run("think", brief, out)
+    _run("think", brief, out, auto)
 
 
 @app.command()

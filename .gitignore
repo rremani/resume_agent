@@ -8,6 +8,12 @@ config.yaml
 __pycache__/
 *.pyc
 
+# distribution build artifacts
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
 # generated outputs
 output/*
 !output/.gitkeep

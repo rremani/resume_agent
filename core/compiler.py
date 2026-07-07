@@ -21,7 +21,7 @@ import json
 import re
 import yaml
 
-from . import store
+from . import store, paths
 from .providers import Provider
 
 NUM_RE = re.compile(r"\d+(?:\.\d+)?%?")
@@ -102,10 +102,28 @@ def compile_wiki(provider: Provider, *, model: str, allow_web: bool = False):
     ok, problems = ground_against_raw(compiled, raw_text)
 
     _write_pages(compiled)
+    # Record what the wiki was just built from, so manual edits to raw/ are
+    # detectable afterwards (and this clears any prior staleness warning).
+    store.write_manifest()
     return {"ok": ok, "problems": problems, "compiled": compiled}
 
 
+def _clear_generated_pages():
+    """Remove existing per-slug pages so a (re)compile is a clean rebuild, not an
+    additive overlay. The LLM can emit a different slug for the same role/project
+    across runs (e.g. 'imkan-dynamic-pricing' vs 'dynamic-pricing-imkan'); without
+    this sweep the stale page lingers and the wiki accumulates duplicates. Safe
+    because career/ is fully compiler-generated — manual edits live in raw/.
+    profile.md / skills.md have fixed names and are overwritten in place."""
+    import glob
+    import os
+    for d in (paths.roles_dir(), paths.projects_dir()):
+        for p in glob.glob(os.path.join(d, "*.md")):
+            os.remove(p)
+
+
 def _write_pages(c: dict):
+    _clear_generated_pages()
     # profile.md
     prof = c.get("profile", {})
     store.write_career_file("profile.md",
@@ -136,11 +154,12 @@ def wiki_to_resume_yaml() -> dict:
     """Assemble the compiled wiki pages into the flat schema render.py wants.
     This is deterministic — no LLM. It just reads the maintained wiki."""
     import glob, os
-    prof_fm, prof_body = store.parse_md(open(os.path.join(store.CAREER, "profile.md")).read())
-    skills_fm, _ = store.parse_md(open(os.path.join(store.CAREER, "skills.md")).read())
+    career = paths.career_dir()
+    prof_fm, prof_body = store.parse_md(open(os.path.join(career, "profile.md")).read())
+    skills_fm, _ = store.parse_md(open(os.path.join(career, "skills.md")).read())
 
     roles = []
-    for p in sorted(glob.glob(os.path.join(store.ROLES, "*.md"))):
+    for p in sorted(glob.glob(os.path.join(paths.roles_dir(), "*.md"))):
         fm, body = store.parse_md(open(p).read())
         roles.append({
             "role": fm.get("role"), "company": fm.get("company"),
