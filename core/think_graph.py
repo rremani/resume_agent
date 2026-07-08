@@ -40,15 +40,17 @@ MAX_ROUNDS = 8  # safety cap on the improve loop
 
 # ---- resume schema (structured output) ---------------------------------
 
+# No `tags` field: tags are never used when tailoring (render's tag filter runs
+# with wanted=None, so everything passes) — emitting a tags[] array per bullet/
+# skill just inflated the structured output toward the token cap. Leaner schema =
+# smaller, cheaper, less-likely-to-truncate output.
 class Bullet(BaseModel):
     text: str
-    tags: list[str] = Field(default_factory=list)
 
 
 class SkillGroup(BaseModel):
     category: str
     items: list[str] = Field(default_factory=list)
-    tags: list[str] = Field(default_factory=list)
 
 
 class Job(BaseModel):
@@ -126,7 +128,13 @@ the candidate's REAL evidence — an editor, never an author.
 - You are given a BLUEPRINT (the intended shape: title, summary angle, ordered \
 themes, lead skills) and the candidate's FULL VERIFIED EXPERIENCE.
 - For each theme, SELECT and reword the candidate's real bullets/projects that \
-evidence it. Order roles and bullets to foreground the high-priority themes.
+evidence it. Order roles and bullets to foreground the high-priority themes, \
+strongest bullet first within each role.
+- Be concise — a recruiter skims, so keep the resume tight and skimmable (aim for \
+1-2 pages). Give the roles most relevant to THIS target more depth, and trim \
+older or less-relevant roles to only their strongest points. You decide how many \
+bullets each role warrants by its relevance — prefer fewer sharp bullets over \
+exhaustive lists.
 - Keep the COMPLETE role history — tailor by emphasis, not deletion.
 - A theme with NO supporting evidence is DROPPED, never fabricated. Do not stretch \
 unrelated work to fill a theme.
@@ -160,14 +168,20 @@ Output the structured resume."""
 
 # ---- model builder ------------------------------------------------------
 
+# A full-resume structured-output JSON (all roles, bullets, tags) can exceed
+# 4k tokens; too low a cap truncates the JSON mid-object and the structured-output
+# parser then raises LengthFinishReasonError. 8192 gives comfortable headroom.
+MAX_OUTPUT_TOKENS = 8192
+
+
 def _build_model(cfg: dict, model_id: str):
     provider = (cfg.get("provider") or "anthropic").lower()
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(model=model_id, max_tokens=4096)
+        return ChatAnthropic(model=model_id, max_tokens=MAX_OUTPUT_TOKENS)
     if provider == "openrouter":
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model=model_id, max_tokens=4096,
+        return ChatOpenAI(model=model_id, max_tokens=MAX_OUTPUT_TOKENS,
                           base_url="https://openrouter.ai/api/v1",
                           api_key=os.environ.get("OPENROUTER_API_KEY"))
     raise ValueError(f"Unknown provider {provider!r}")
@@ -296,7 +310,15 @@ def _route_improve(state: State):
 def run_think(cfg: dict, *, opening: str, out_stem: str, ask_fn, say_fn,
               notify_fn, render_fn, allow_web: bool = True) -> dict:
     """Run the blueprint→fill workflow → grounded resume → render."""
-    model = _build_model(cfg, cfg["modes"]["think"]["model"])
+    # Build the model lazily: the first question (understand) needs no LLM, so
+    # deferring construction (and the heavy langchain_openai/anthropic import it
+    # triggers) until the blueprint step lets the first prompt appear ~1s sooner.
+    _cache = {}
+
+    def model():
+        if "m" not in _cache:
+            _cache["m"] = _build_model(cfg, cfg["modes"]["think"]["model"])
+        return _cache["m"]
 
     def understand(state: State) -> dict:
         target = (state.get("target") or "").strip()
@@ -324,12 +346,12 @@ def run_think(cfg: dict, *, opening: str, out_stem: str, ask_fn, say_fn,
 
     def blueprint(state: State) -> dict:
         notify_fn("planning the resume for this target…")
-        bp = blueprint_resume(model, state["target"], state["inventory"])
+        bp = blueprint_resume(model(), state["target"], state["inventory"])
         return {"blueprint": bp.model_dump()}
 
     def fill(state: State) -> dict:
         notify_fn("selecting your best-matching experience…")
-        resume = fill_resume(model, state["blueprint"], state["evidence"])
+        resume = fill_resume(model(), state["blueprint"], state["evidence"])
         return {"draft": resume.model_dump()}
 
     def improve(state: State) -> dict:
@@ -347,7 +369,7 @@ def run_think(cfg: dict, *, opening: str, out_stem: str, ask_fn, say_fn,
 
     def edit(state: State) -> dict:
         notify_fn("applying your change…")
-        resume = draft_resume(model, state["target"], state["evidence"],
+        resume = draft_resume(model(), state["target"], state["evidence"],
                               feedback=state.get("feedback", ""),
                               current=state.get("draft"))
         return {"draft": resume.model_dump()}
@@ -387,8 +409,19 @@ def run_think(cfg: dict, *, opening: str, out_stem: str, ask_fn, say_fn,
     builder.add_edge("finalize", END)
     graph = builder.compile()
 
-    final = graph.invoke({"target": opening or "", "out_stem": out_stem},
-                         config={"recursion_limit": 50})
+    try:
+        final = graph.invoke({"target": opening or "", "out_stem": out_stem},
+                             config={"recursion_limit": 50})
+    except Exception as e:
+        # A truncated structured-output reply surfaces as LengthFinishReasonError;
+        # show a clean message instead of a raw traceback. Re-raise anything else
+        # so genuine bugs still surface.
+        if type(e).__name__ == "LengthFinishReasonError" or "length limit" in str(e):
+            notify_fn("the model's reply was too long to parse — try a more "
+                      "specific target, or run again.")
+            return {"aborted": True, "yaml": None, "docx": None, "pdf": None,
+                    "ok": None, "problems": []}
+        raise
     if final.get("aborted"):
         return {"aborted": True, "yaml": None, "docx": None, "pdf": None,
                 "ok": None, "problems": []}

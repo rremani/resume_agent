@@ -124,11 +124,13 @@ def _run(mode: str, brief: str, out: str | None, auto: bool = False,
 
 
 def _run_think(cfg, provider, m, brief, out):
-    """LangGraph editor workflow: understand → draft (edit vetted material) →
-    improve loop → finalize (write-back + grounded render)."""
-    from core import think_graph, agent as _agent
+    """LangGraph editor workflow: understand → blueprint → fill → improve loop →
+    finalize (grounded render)."""
     allow_web = bool(m.get("allow_web", True))
 
+    # Print the banner BEFORE importing think_graph: that import pulls in
+    # langgraph/langchain (~1.5s), so showing the banner first means the terminal
+    # isn't frozen while it loads.
     web_state = "[green]on[/]" if allow_web else "[dim]off[/]"
     console.print(Panel.fit(
         f"[bold]think[/]  model=[cyan]{m['model']}[/]  web={web_state}",
@@ -136,6 +138,9 @@ def _run_think(cfg, provider, m, brief, out):
     console.print("[dim]It tailors a resume from your verified experience, shows a "
                   "preview, and refines on your changes.\n"
                   "Reply with changes · 'done' to generate · 'quit' to abort.[/]\n")
+
+    with console.status("[dim]starting up…[/]", spinner="dots"):
+        from core import think_graph, agent as _agent
 
     def ask_fn():
         return Prompt.ask("[bold cyan]you[/]")

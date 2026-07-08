@@ -84,6 +84,11 @@ def test_fill_system_forbids_fabricating_empty_themes():
     assert "DROPPED" in tg.FILL_SYSTEM and "never fabricated" in tg.FILL_SYSTEM
 
 
+def test_fill_system_guides_concise_relevance_based_length():
+    # Length is LLM-decided by relevance — no hardcoded per-role bullet counts.
+    assert "skimmable" in tg.FILL_SYSTEM and "relevan" in tg.FILL_SYSTEM
+
+
 # ---- edit step (stub model) --------------------------------------------
 
 def test_edit_applies_one_change_to_current():
@@ -149,5 +154,11 @@ def test_build_model_selects_provider(monkeypatch):
 
 def test_resume_schema_round_trips():
     r = tg.Resume(name="Ada", experience=[
-        tg.Job(role="Eng", company="Acme", bullets=[tg.Bullet(text="did X", tags=["ml"])])])
+        tg.Job(role="Eng", company="Acme", bullets=[tg.Bullet(text="did X")])])
     assert r.model_dump()["experience"][0]["bullets"][0]["text"] == "did X"
+
+
+def test_bullet_schema_has_no_tags():
+    # tags are unused when tailoring; keeping them out of the schema shrinks output
+    assert "tags" not in tg.Bullet.model_fields
+    assert "tags" not in tg.SkillGroup.model_fields

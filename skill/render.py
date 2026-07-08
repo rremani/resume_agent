@@ -18,6 +18,14 @@ from docx.oxml import OxmlElement
 
 BLACK = RGBColor(0x00, 0x00, 0x00)
 DARK = RGBColor(0x22, 0x22, 0x22)
+# Gray hierarchy (Awesome-CV-inspired): titles read strong, secondary info
+# recedes. INK = name/headings/titles, BODY = readable content, MUTED = dates/
+# company/location, RULE = hairline section underline. ATS-neutral (parsers
+# ignore colour); keeps the serif, ATS-safe look.
+INK = RGBColor(0x1A, 0x1A, 0x1A)
+BODY = RGBColor(0x33, 0x33, 0x33)
+MUTED = RGBColor(0x5D, 0x5D, 0x5D)
+RULE_HEX = "9A9A9A"
 FONT = "Georgia"          # classic, FAANG-typical serif; swap to "Calibri" for sans
 CONTENT_WIDTH_IN = 7.1    # 8.5 - 2*0.7 margins
 
@@ -77,36 +85,42 @@ def section_heading(doc, text):
     r = p.add_run(text.upper())
     r.bold = True
     r.font.size = Pt(11)
-    r.font.color.rgb = BLACK
+    r.font.color.rgb = INK
     r.font.name = FONT
     # letter spacing
     rPr = r._element.get_or_add_rPr()
     spc = OxmlElement("w:spacing")
     spc.set(qn("w:val"), "30")
     rPr.append(spc)
-    add_hrule(p)
+    add_hrule(p, color=RULE_HEX)
     return p
 
 
-def tabbed_line(doc, left_runs, right_text, right_italic=True, size=10):
-    """One paragraph: left content, right-aligned date via right tab stop."""
+def tabbed_line(doc, left_runs, right_text, right_italic=True, size=10,
+                right_color=None):
+    """One paragraph: left content, right-aligned date via right tab stop.
+
+    Each left run is (text, bold, italic[, colour]); colour defaults to INK.
+    The right (date) text defaults to MUTED so it recedes below the title."""
     p = doc.add_paragraph()
     p.paragraph_format.space_after = Pt(0)
     p.paragraph_format.space_before = Pt(0)
     tabs = p.paragraph_format.tab_stops
     tabs.add_tab_stop(Inches(CONTENT_WIDTH_IN), WD_TAB_ALIGNMENT.RIGHT)
-    for txt, bold, italic in left_runs:
+    for run in left_runs:
+        txt, bold, italic = run[0], run[1], run[2]
+        color = run[3] if len(run) > 3 else INK
         r = p.add_run(txt)
         r.bold = bold
         r.italic = italic
         r.font.size = Pt(size)
         r.font.name = FONT
-        r.font.color.rgb = DARK
+        r.font.color.rgb = color
     r = p.add_run("\t" + right_text)
     r.italic = right_italic
     r.font.size = Pt(size - 0.5)
     r.font.name = FONT
-    r.font.color.rgb = DARK
+    r.font.color.rgb = right_color or MUTED
     return p
 
 
@@ -127,6 +141,13 @@ from xml.sax.saxutils import escape
 
 PDF_BLACK = HexColor(0x000000)
 PDF_DARK = HexColor(0x222222)
+# Gray hierarchy — mirrors the DOCX palette above (INK / BODY / MUTED / RULE).
+PDF_INK = HexColor(0x1A1A1A)
+PDF_BODY = HexColor(0x333333)
+PDF_MUTED = HexColor(0x5D5D5D)
+PDF_RULE = HexColor(0x9A9A9A)
+MUTED_HEX = "#5D5D5D"      # for inline <font> colouring inside Paragraph markup
+INK_HEX = "#1A1A1A"
 # Built-in PDF serif (Times) — no system-font dependency, so the renderer
 # stays portable for a frozen single-file distribution (Task 4). The DOCX
 # keeps Georgia; both are the serif look the design calls for.
@@ -136,6 +157,12 @@ SERIF_ITALIC = "Times-Italic"
 
 CONTENT_WIDTH = CONTENT_WIDTH_IN * inch
 DATE_COL_W = 1.6 * inch    # right column reserved for the date
+# SimpleDocTemplate's frame insets content by 6pt on each side. Paragraphs (the
+# section headings, bullets, summary) respect that inset; a full-width table does
+# not, so it renders 6pt left of everything. Size the role/date table to the
+# frame's true CONTENT width so it left-aligns with the headings above it.
+FRAME_PAD = 6
+TABLE_WIDTH = CONTENT_WIDTH - 2 * FRAME_PAD
 
 
 def _esc(text):
@@ -147,7 +174,7 @@ def _date_row(left_html, right_text, story_styles):
     a borderless 2-col table so the date hugs the right margin like the DOCX."""
     left = Paragraph(left_html, story_styles["row_left"])
     right = Paragraph(_esc(right_text), story_styles["row_right"])
-    t = Table([[left, right]], colWidths=[CONTENT_WIDTH - DATE_COL_W, DATE_COL_W])
+    t = Table([[left, right]], colWidths=[TABLE_WIDTH - DATE_COL_W, DATE_COL_W])
     t.setStyle(TableStyle([
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
         ("RIGHTPADDING", (0, 0), (-1, -1), 0),
@@ -162,39 +189,39 @@ def _pdf_styles():
     dark = "#222222"
     return {
         "name": ParagraphStyle("name", fontName=SERIF_BOLD, fontSize=20,
-                               textColor=PDF_BLACK, alignment=TA_CENTER,
+                               textColor=PDF_INK, alignment=TA_CENTER,
                                leading=23, spaceAfter=2),
         # splitLongWords=0 stops ReportLab from breaking a URL mid-token; the
         # line wraps only at the "  |  " separators, keeping each link intact.
         "contact": ParagraphStyle("contact", fontName=SERIF, fontSize=8.5,
-                                  textColor=PDF_DARK, alignment=TA_CENTER,
+                                  textColor=PDF_MUTED, alignment=TA_CENTER,
                                   leading=11, spaceAfter=2, splitLongWords=0),
         "section": ParagraphStyle("section", fontName=SERIF_BOLD, fontSize=11,
-                                  textColor=PDF_BLACK, leading=13, spaceBefore=8,
+                                  textColor=PDF_INK, leading=13, spaceBefore=8,
                                   spaceAfter=1),
         "summary": ParagraphStyle("summary", fontName=SERIF, fontSize=9.5,
-                                  textColor=PDF_DARK, leading=12, spaceAfter=2),
+                                  textColor=PDF_BODY, leading=12, spaceAfter=2),
         "row_left": ParagraphStyle("row_left", fontName=SERIF, fontSize=10.5,
-                                   textColor=PDF_DARK, leading=13, alignment=TA_LEFT),
+                                   textColor=PDF_INK, leading=13, alignment=TA_LEFT),
         # Same fontSize + leading as row_left so the right-aligned date shares the
         # exact baseline of the role heading in the 2-col table (VALIGN BOTTOM).
         "row_right": ParagraphStyle("row_right", fontName=SERIF_ITALIC, fontSize=10.5,
-                                    textColor=PDF_DARK, leading=13, alignment=TA_RIGHT),
+                                    textColor=PDF_MUTED, leading=13, alignment=TA_RIGHT),
         "location": ParagraphStyle("location", fontName=SERIF_ITALIC, fontSize=8.5,
-                                   textColor=PDF_DARK, leading=10, spaceAfter=1),
+                                   textColor=PDF_MUTED, leading=10, spaceAfter=1),
         "bullet": ParagraphStyle("bullet", fontName=SERIF, fontSize=9.5,
-                                 textColor=PDF_DARK, leading=12, leftIndent=12,
+                                 textColor=PDF_BODY, leading=12, leftIndent=12,
                                  bulletIndent=2, spaceAfter=2),
         "skill": ParagraphStyle("skill", fontName=SERIF, fontSize=9.5,
-                                textColor=PDF_DARK, leading=13.5, spaceAfter=5),
+                                textColor=PDF_BODY, leading=13.5, spaceAfter=5),
         "edu_sub": ParagraphStyle("edu_sub", fontName=SERIF_ITALIC, fontSize=9,
-                                  textColor=PDF_DARK, leading=11, spaceAfter=3),
+                                  textColor=PDF_MUTED, leading=11, spaceAfter=3),
     }
 
 
 def _pdf_section(story, styles, title):
     story.append(Paragraph(_esc(title).upper(), styles["section"]))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=PDF_BLACK,
+    story.append(HRFlowable(width="100%", thickness=0.5, color=PDF_RULE,
                             spaceBefore=1, spaceAfter=3))
 
 
@@ -236,7 +263,7 @@ def build_pdf(data, wanted, out_stem):
         for job, kept in jobs:
             dates = f'{job.get("start","")} – {job.get("end","")}'
             left = (f'<b>{_esc(job["role"])}  -  </b>'
-                    f'{_esc(job["company"])}')
+                    f'<font color="{MUTED_HEX}">{_esc(job["company"])}</font>')
             story.append(_date_row(left, dates, styles))
             if job.get("location"):
                 story.append(Paragraph(_esc(job["location"]), styles["location"]))
@@ -250,7 +277,7 @@ def build_pdf(data, wanted, out_stem):
     if groups:
         _pdf_section(story, styles, "Technical Skills")
         for g in groups:
-            html = (f'<b>{_esc(g["category"])}:  </b>'
+            html = (f'<font color="{INK_HEX}"><b>{_esc(g["category"])}:  </b></font>'
                     f'{_esc(" · ".join(g["items"]))}')
             story.append(Paragraph(html, styles["skill"]))
 
@@ -280,7 +307,7 @@ def build_docx(data, wanted, out_stem):
     normal = doc.styles["Normal"]
     normal.font.name = FONT
     normal.font.size = Pt(10)
-    normal.font.color.rgb = DARK
+    normal.font.color.rgb = BODY
 
     # Header
     name_p = doc.add_paragraph()
@@ -290,7 +317,7 @@ def build_docx(data, wanted, out_stem):
     nr.bold = True
     nr.font.size = Pt(20)
     nr.font.name = FONT
-    nr.font.color.rgb = BLACK
+    nr.font.color.rgb = INK
     rPr = nr._element.get_or_add_rPr()
     spc = OxmlElement("w:spacing"); spc.set(qn("w:val"), "40"); rPr.append(spc)
 
@@ -305,7 +332,7 @@ def build_docx(data, wanted, out_stem):
     cr = cp.add_run("  |  ".join(bits))
     cr.font.size = Pt(8.5)
     cr.font.name = FONT
-    cr.font.color.rgb = DARK
+    cr.font.color.rgb = MUTED
 
     # Summary
     if data.get("summary"):
@@ -313,7 +340,7 @@ def build_docx(data, wanted, out_stem):
         sp = doc.add_paragraph(data["summary"].strip())
         sp.paragraph_format.space_after = Pt(3)
         for r in sp.runs:
-            r.font.size = Pt(9.5); r.font.name = FONT; r.font.color.rgb = DARK
+            r.font.size = Pt(9.5); r.font.name = FONT; r.font.color.rgb = BODY
 
     # Experience
     jobs = []
@@ -326,8 +353,8 @@ def build_docx(data, wanted, out_stem):
         for job, kept in jobs:
             dates = f'{job.get("start","")} \u2013 {job.get("end","")}'
             tabbed_line(doc,
-                        [(job["role"] + "  -  ", True, False),
-                         (job["company"], False, False)],
+                        [(job["role"] + "  -  ", True, False, INK),
+                         (job["company"], False, False, MUTED)],
                         dates, size=10.5)
             if job.get("location"):
                 loc_p = doc.add_paragraph()
@@ -336,7 +363,7 @@ def build_docx(data, wanted, out_stem):
                 lr.italic = True
                 lr.font.size = Pt(8.5)
                 lr.font.name = FONT
-                lr.font.color.rgb = DARK
+                lr.font.color.rgb = MUTED
             for b in kept:
                 bp = doc.add_paragraph(style="List Bullet")
                 bp.paragraph_format.space_after = Pt(2)
@@ -344,7 +371,7 @@ def build_docx(data, wanted, out_stem):
                 br = bp.add_run(" ".join(b["text"].split()))
                 br.font.size = Pt(9.5)
                 br.font.name = FONT
-                br.font.color.rgb = DARK
+                br.font.color.rgb = BODY
 
     # Skills
     groups = [g for g in data.get("skills", [])
@@ -356,21 +383,21 @@ def build_docx(data, wanted, out_stem):
             p.paragraph_format.space_after = Pt(5)      # breathing room (was 2)
             p.paragraph_format.line_spacing = 1.15
             r1 = p.add_run(g["category"] + ":  ")
-            r1.bold = True; r1.font.size = Pt(9.5); r1.font.name = FONT; r1.font.color.rgb = BLACK
+            r1.bold = True; r1.font.size = Pt(9.5); r1.font.name = FONT; r1.font.color.rgb = INK
             r2 = p.add_run(" · ".join(g["items"]))
-            r2.font.size = Pt(9.5); r2.font.name = FONT; r2.font.color.rgb = DARK
+            r2.font.size = Pt(9.5); r2.font.name = FONT; r2.font.color.rgb = BODY
 
     # Education \u2014 chain the whole section so it never splits across a page.
     if data.get("education"):
         edu_paras = [section_heading(doc, "Education")]
         for e in data["education"]:
             dates = f'{e.get("start","")} \u2013 {e.get("end","")}'
-            dp = tabbed_line(doc, [(e["degree"], True, False)], dates, size=9.5)
+            dp = tabbed_line(doc, [(e["degree"], True, False, INK)], dates, size=9.5)
             sub = e["institution"] + (f'  |  {e["location"]}' if e.get("location") else "")
             sp = doc.add_paragraph()
             sp.paragraph_format.space_after = Pt(3)
             sr = sp.add_run(sub)
-            sr.italic = True; sr.font.size = Pt(9); sr.font.name = FONT; sr.font.color.rgb = DARK
+            sr.italic = True; sr.font.size = Pt(9); sr.font.name = FONT; sr.font.color.rgb = MUTED
             dp.paragraph_format.keep_together = True
             sp.paragraph_format.keep_together = True
             edu_paras += [dp, sp]
