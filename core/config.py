@@ -54,33 +54,32 @@ def write_env_var(name: str, value: str):
         pass
     os.environ[name] = value
 
+# One model per connection. fast and think use the SAME model — the only
+# difference is that fast is one-shot and think is conversational. Web research
+# is on by default (think uses it to understand the target).
 DEFAULTS = {
     "provider": "anthropic",
-    "modes": {
-        "fast": {
-            "model": "claude-haiku-4-5-20251001",
-            "allow_web": False,
-            "conversational": False,
-        },
-        "think": {
-            "model": "claude-sonnet-4-6",
-            "allow_web": True,
-            "conversational": True,
-        },
-    },
+    "model": "claude-sonnet-4-6",
+    "allow_web": True,
 }
 
-# Suggested defaults shown during onboarding, per provider.
+# Suggested model shown during onboarding, per provider.
 SUGGESTED = {
-    "anthropic": {
-        "fast": "claude-haiku-4-5-20251001",
-        "think": "claude-sonnet-4-6",
-    },
-    "openrouter": {
-        "fast": "google/gemma-4-31b-it",
-        "think": "google/gemini-3.5-flash",
-    },
+    "anthropic": "claude-sonnet-4-6",
+    "openrouter": "google/gemini-3.5-flash",
 }
+
+
+def migrate(cfg: dict) -> dict:
+    """Bring an older two-model config (modes.fast/think) up to the single-model
+    shape so existing users don't have to re-onboard."""
+    if cfg and "model" not in cfg and "modes" in cfg:
+        think = cfg.get("modes", {}).get("think", {})
+        fast = cfg.get("modes", {}).get("fast", {})
+        cfg["model"] = think.get("model") or fast.get("model") or DEFAULTS["model"]
+        cfg["allow_web"] = think.get("allow_web", True)
+        cfg.pop("modes", None)
+    return cfg
 
 
 def load_config():
@@ -115,11 +114,9 @@ def onboard():
         provider = _ask("Provider (anthropic / openrouter)", "anthropic").lower()
 
     sug = SUGGESTED[provider]
-    print("\nNow pick models for each mode.")
-    print("  fast  = cheaper model, single-shot, no web search")
-    print("  think = stronger model, conversational, web search enabled\n")
-    fast_model = _ask("Fast-mode model", sug["fast"])
-    think_model = _ask("Think-mode model", sug["think"])
+    print("\nPick the model to use (one model for everything).")
+    print("  fast = one-shot · think = conversational — both use this model.\n")
+    model = _ask("Model", sug)
 
     # --- API key → .env (never config.yaml) ---
     env_var = ENV_VAR[provider]
@@ -135,10 +132,8 @@ def onboard():
 
     cfg = {
         "provider": provider,
-        "modes": {
-            "fast": {"model": fast_model, "allow_web": False, "conversational": False},
-            "think": {"model": think_model, "allow_web": True, "conversational": True},
-        },
+        "model": model,
+        "allow_web": True,
     }
     _maybe_setup_search(cfg)
     save_config(cfg)
@@ -211,10 +206,10 @@ def _maybe_bootstrap(cfg, key_present: bool):
     if not text.strip():
         print("  Could not extract text (scanned PDF?). Needs OCR; skipping for now.")
         return
-    print(f"  Extracted via {method}; compiling wiki with {cfg['modes']['think']['model']}…")
+    print(f"  Extracted via {method}; compiling wiki with {cfg['model']}…")
     try:
         provider = make_provider(cfg["provider"])
-        res = ingest.bootstrap_from_text(provider, model=cfg["modes"]["think"]["model"],
+        res = ingest.bootstrap_from_text(provider, model=cfg["model"],
                                          resume_text=text)
         if res["ok"]:
             print("  ✓ Career wiki compiled — every fact traces to your resume.")
@@ -231,4 +226,8 @@ def ensure_config():
     cfg = load_config()
     if cfg is None:
         cfg = onboard()
+    needs_migrate = "modes" in (cfg or {})
+    cfg = migrate(cfg)
+    if needs_migrate:
+        save_config(cfg)   # rewrite the file once in the new single-model shape
     return cfg

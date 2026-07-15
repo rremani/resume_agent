@@ -25,8 +25,28 @@ from core.config import ensure_config, load_config
 from core.providers import make_provider
 from core import agent
 
-app = typer.Typer(add_completion=False, help="Generate tailored resumes from your career store.")
+app = typer.Typer(add_completion=False, help=(
+    "Run `resume` (no arguments) to open the chat and tailor your resume. "
+    "The commands below are for setup and maintenance."))
 console = Console()
+
+
+@app.callback(invoke_without_command=True)
+def _default(ctx: typer.Context):
+    """Bare `resume` opens the interactive chat (type a role or paste a JD).
+    Subcommands (think / fast / add / onboard / bootstrap / recompile) still work."""
+    if ctx.invoked_subcommand is not None:
+        return
+    import sys
+    cfg = ensure_config()
+    if not _ensure_wiki(cfg):
+        raise typer.Exit()
+    if not sys.stdout.isatty():
+        console.print('The interactive chat needs a terminal — use '
+                      '[bold]resume think "<brief>"[/] or [bold]resume fast "<brief>"[/].')
+        raise typer.Exit()
+    from tui import run_repl
+    run_repl(cfg)
 
 
 def _report(res: dict):
@@ -70,9 +90,8 @@ def _check_staleness(cfg, provider, auto: bool):
                "— the career wiki may be out of date.")
     if auto:
         console.print(f"{msg}\n[dim]--auto: recompiling…[/]")
-        m = cfg["modes"]["think"]
         with console.status("[bold]Recompiling career wiki…[/]", spinner="dots"):
-            res = compiler.compile_wiki(provider, model=m["model"])
+            res = compiler.compile_wiki(provider, model=cfg["model"])
         console.print("[green]✓ wiki recompiled[/]" if res["ok"]
                       else "[yellow]⚠ recompiled with grounding flags[/]")
     else:
@@ -81,27 +100,55 @@ def _check_staleness(cfg, provider, auto: bool):
                       "(or pass [bold]--auto[/] to recompile automatically).[/]\n")
 
 
-def _run(mode: str, brief: str, out: str | None, auto: bool = False,
-         web: bool = False):
-    from core import store as _store
+def _ensure_wiki(cfg) -> bool:
+    """No career wiki yet? Offer to build it inline instead of dead-ending the
+    user to a separate command. Returns True once a wiki exists."""
+    import os
+    from core import store as _store, config as _config
+    if not _store.career_is_empty():
+        return True
+
+    if _store.raw_is_empty():
+        # No sources at all → build from an existing resume now (same flow as
+        # onboarding), rather than bouncing to `resume bootstrap`.
+        console.print("[yellow]No career wiki yet.[/] Let's build one from your "
+                      "existing resume.")
+        key_present = bool(os.environ.get(_config.ENV_VAR[cfg["provider"]]))
+        _config._maybe_bootstrap(cfg, key_present=key_present)
+    else:
+        # Sources exist but were never compiled → recompile, don't re-bootstrap.
+        console.print("[yellow]Your raw sources aren't compiled into a wiki yet.[/]")
+        if not os.environ.get(_config.ENV_VAR[cfg["provider"]]):
+            console.print("[dim]Set your API key, then run [bold]resume recompile[/].[/]")
+        elif Prompt.ask("Compile them now?", default="y").strip().lower().startswith("y"):
+            from core import compiler
+            with console.status("[bold]Compiling career wiki…[/]", spinner="dots"):
+                compiler.compile_wiki(make_provider(cfg["provider"]),
+                                      model=cfg["model"])
+
     if _store.career_is_empty():
-        console.print("[yellow]No career wiki yet.[/] Run "
-                      "[bold]resume bootstrap <your-resume.pdf>[/] first.")
-        raise typer.Exit()
+        console.print("[dim]Still no wiki — run [bold]resume bootstrap "
+                      "<your-resume>[/] when you're ready.[/]")
+        return False
+    return True
+
+
+def _run(mode: str, brief: str, out: str | None, auto: bool = False,
+         web: bool = False, plain: bool = False):
     cfg = ensure_config()
-    m = cfg["modes"][mode]
+    if not _ensure_wiki(cfg):
+        raise typer.Exit()
     out = out or mode
     provider = make_provider(cfg["provider"])
 
     _check_staleness(cfg, provider, auto)
 
     if mode == "think":
-        _run_think(cfg, provider, m, brief, out)
+        _run_think(cfg, provider, brief, out, plain=plain)
         return
 
-    # fast: single-shot. --web opts this run into web (provider built-in +
-    # the configured explicit search tool); default stays offline.
-    allow_web = bool(web)
+    # fast: single-shot, same model as think. Web follows config (or --web override).
+    allow_web = bool(web) or bool(cfg.get("allow_web", True))
     search_tool = None
     if allow_web:
         from core import search as _search
@@ -113,27 +160,37 @@ def _run(mode: str, brief: str, out: str | None, auto: bool = False,
     search_label = f"[cyan]{search_name}[/]" if search_tool else "[dim]built-in[/]"
     console.print(Panel.fit(
         f"[bold]fast[/]  provider=[cyan]{cfg['provider']}[/]  "
-        f"model=[cyan]{m['model']}[/]  web={web_label}  search={search_label}",
+        f"model=[cyan]{cfg['model']}[/]  web={web_label}  search={search_label}",
         border_style="blue"))
 
     with console.status("[bold]Generating tailored resume…[/]", spinner="dots"):
-        res = agent.run_once(provider, model=m["model"], brief=brief or "",
+        res = agent.run_once(provider, model=cfg["model"], brief=brief or "",
                              allow_web=allow_web, out_stem=out,
                              search_tool=search_tool, search_max_results=search_max)
     _report(res)
 
 
-def _run_think(cfg, provider, m, brief, out):
-    """LangGraph editor workflow: understand → blueprint → fill → improve loop →
-    finalize (grounded render)."""
-    allow_web = bool(m.get("allow_web", True))
+def _run_think(cfg, provider, brief, out, plain: bool = False):
+    """JD-driven tailoring workflow: understand → assess → convo → fill → improve
+    → finalize (grounded render)."""
+    import sys
+    allow_web = bool(cfg.get("allow_web", True))
+
+    # Inline Claude-style TUI by default in a real terminal; fall back to the
+    # plain flow when piped/non-TTY or --plain (a pinned-input REPL needs a TTY).
+    if not plain and sys.stdout.isatty():
+        from tui import run_think_tui
+        res = run_think_tui(cfg, opening=brief or "", out_stem=out, allow_web=allow_web)
+        if res.get("aborted"):
+            raise typer.Exit()
+        return
 
     # Print the banner BEFORE importing think_graph: that import pulls in
     # langgraph/langchain (~1.5s), so showing the banner first means the terminal
     # isn't frozen while it loads.
     web_state = "[green]on[/]" if allow_web else "[dim]off[/]"
     console.print(Panel.fit(
-        f"[bold]think[/]  model=[cyan]{m['model']}[/]  web={web_state}",
+        f"[bold]think[/]  model=[cyan]{cfg['model']}[/]  web={web_state}",
         border_style="blue"))
     console.print("[dim]It tailors a resume from your verified experience, shows a "
                   "preview, and refines on your changes.\n"
@@ -171,7 +228,7 @@ def onboard():
     run_onboard()
 
 
-@app.command()
+@app.command(hidden=True)   # primary surface is /fast inside the `resume` chat
 def fast(brief: str = typer.Argument(..., help="target role / brief text"),
          out: str = typer.Option(None, "--out", help="output filename stem"),
          web: bool = typer.Option(False, "--web",
@@ -182,32 +239,37 @@ def fast(brief: str = typer.Argument(..., help="target role / brief text"),
     _run("fast", brief, out, auto, web)
 
 
-@app.command()
+@app.command(hidden=True)   # primary surface is `resume` (or /think inside the chat)
 def think(brief: str = typer.Argument("", help="target role / brief text"),
           file: str = typer.Option(None, "--file", help="read brief from a file (JD)"),
           out: str = typer.Option(None, "--out", help="output filename stem"),
           auto: bool = typer.Option(False, "--auto",
-                                    help="auto-recompile if raw/ changed")):
-    """Tailors your verified experience to a target: drafts, shows suggestions,
-    refines on your feedback, then writes the grounded resume."""
+                                    help="auto-recompile if raw/ changed"),
+          plain: bool = typer.Option(False, "--plain",
+                                     help="disable the interactive TUI (plain flow)")):
+    """Tailors your verified experience to a target in an interactive TUI: drafts,
+    shows a live preview, refines on your feedback, then writes the grounded resume."""
     if file:
         brief = open(file).read()
-    _run("think", brief, out, auto)
+    _run("think", brief, out, auto, plain=plain)
 
 
 @app.command()
 def status():
     """Show current configuration."""
+    from core.config import migrate
     cfg = load_config()
     if not cfg:
         console.print("[yellow]No config yet — run:[/] resume onboard")
         raise typer.Exit()
+    cfg = migrate(cfg)
     t = Table(title="Resume Agent config")
     t.add_column("setting"); t.add_column("value")
     t.add_row("provider", cfg["provider"])
-    for mode, m in cfg["modes"].items():
-        t.add_row(f"{mode}.model", m["model"])
-        t.add_row(f"{mode}.web", str(m["allow_web"]))
+    t.add_row("model", cfg.get("model", "—"))
+    t.add_row("web", str(cfg.get("allow_web", True)))
+    search = (cfg.get("search") or {}).get("provider", "built-in")
+    t.add_row("search", search)
     console.print(t)
 
 
@@ -222,7 +284,7 @@ def bootstrap(doc: str = typer.Argument(..., help="path to your existing resume 
                       "or clear raw/ and career/ to re-bootstrap.")
         raise typer.Exit()
     cfg = ensure_config()
-    m = model or cfg["modes"]["think"]["model"]
+    m = model or cfg["model"]
     provider = make_provider(cfg["provider"])
 
     try:
@@ -249,13 +311,13 @@ def bootstrap(doc: str = typer.Argument(..., help="path to your existing resume 
     console.print("[dim]raw/ holds the immutable original; career/ holds the wiki.[/]")
 
 
-@app.command()
+@app.command(hidden=True)   # primary surface is /add inside the `resume` chat
 def add(opening: str = typer.Argument("", help="what you want to add (free text)"),
         model: str = typer.Option(None, "--model")):
     """Conversationally add a new project / certificate / skill, then recompile."""
     from core import ingest, compiler
     cfg = ensure_config()
-    m = model or cfg["modes"]["think"]["model"]
+    m = model or cfg["model"]
     provider = make_provider(cfg["provider"])
 
     if not opening:
@@ -289,7 +351,7 @@ def recompile(model: str = typer.Option(None, "--model")):
     """Rebuild the career wiki from raw sources (no new input)."""
     from core import compiler
     cfg = ensure_config()
-    m = model or cfg["modes"]["think"]["model"]
+    m = model or cfg["model"]
     provider = make_provider(cfg["provider"])
     with console.status("[bold]Recompiling…[/]", spinner="dots"):
         res = compiler.compile_wiki(provider, model=m)
