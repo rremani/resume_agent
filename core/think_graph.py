@@ -170,14 +170,14 @@ Output the structured resume."""
 MAX_OUTPUT_TOKENS = 8192
 
 
-def _build_model(cfg: dict, model_id: str):
+def _build_model(cfg: dict, model_id: str, max_tokens: int = MAX_OUTPUT_TOKENS):
     provider = (cfg.get("provider") or "anthropic").lower()
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(model=model_id, max_tokens=MAX_OUTPUT_TOKENS)
+        return ChatAnthropic(model=model_id, max_tokens=max_tokens)
     if provider == "openrouter":
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model=model_id, max_tokens=MAX_OUTPUT_TOKENS,
+        return ChatOpenAI(model=model_id, max_tokens=max_tokens,
                           base_url="https://openrouter.ai/api/v1",
                           api_key=os.environ.get("OPENROUTER_API_KEY"))
     raise ValueError(f"Unknown provider {provider!r}")
@@ -202,16 +202,26 @@ def wiki_summary() -> str:
             + "\nSkills: " + ", ".join(c for c in cats if c))
 
 
+def _degenerate(text: str) -> bool:
+    """True for a repetition-loop output (weak models sometimes loop forever)."""
+    words = text.split()
+    return len(words) > 25 and len(set(w.lower() for w in words)) < len(words) * 0.4
+
+
 def session_greeting(cfg: dict) -> str:
-    """LLM-authored opening message, aware of the candidate's background."""
-    model = _build_model(cfg, cfg["model"])
+    """LLM-authored opening message, aware of the candidate's background. Hard-capped
+    and truncated to 1-2 sentences; returns "" (→ static fallback) on a degenerate
+    loop, so a rambling model can never flood the terminal."""
+    model = _build_model(cfg, cfg["model"], max_tokens=120)
     msg = model.invoke([SystemMessage(content=GREET_SYSTEM),
                         HumanMessage(content="Candidate background:\n" + wiki_summary()
                                      + "\n\nWrite the opening greeting now.")])
     content = getattr(msg, "content", msg)
     if isinstance(content, list):   # some providers return content parts
         content = " ".join(str(getattr(p, "text", p)) for p in content)
-    return str(content).strip()
+    raw = " ".join(str(content).split())               # collapse whitespace/newlines
+    text = " ".join(re.split(r"(?<=[.!?])\s+", raw)[:2]).strip()[:320]   # first 1-2 sentences
+    return "" if _degenerate(text) else text
 
 
 # ---- LLM steps (module-level, testable with a stub model) --------------

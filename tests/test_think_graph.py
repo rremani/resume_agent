@@ -257,9 +257,29 @@ def test_wiki_summary_and_session_greeting(monkeypatch):
     class _Stub:
         def invoke(self, msgs): return _Msg()
 
-    monkeypatch.setattr(tg, "_build_model", lambda cfg, mid: _Stub())
+    monkeypatch.setattr(tg, "_build_model", lambda *a, **k: _Stub())
     g = tg.session_greeting({"provider": "anthropic", "model": "x"})
     assert "What role" in g
+
+
+def test_session_greeting_guards_against_runaway_loops(monkeypatch):
+    monkeypatch.setattr(tg.compiler, "wiki_to_resume_yaml",
+                        lambda: {"experience": [], "skills": []})
+
+    def stub(content):
+        msg = type("M", (), {"content": content})()
+        model = type("S", (), {"invoke": lambda self, m: msg})()
+        return lambda *a, **k: model
+
+    # a repetition blob (no sentence breaks) → degenerate → "" (static fallback)
+    monkeypatch.setattr(tg, "_build_model", stub("share the job description " * 60))
+    assert tg.session_greeting({"provider": "anthropic", "model": "x"}) == ""
+
+    # good opening that then loops → keep the first 1-2 sentences, stay short
+    monkeypatch.setattr(tg, "_build_model",
+                        stub("Hi! What role are you targeting? " + "Please share it. " * 60))
+    g = tg.session_greeting({"provider": "anthropic", "model": "x"})
+    assert g.startswith("Hi! What role are you targeting?") and len(g) <= 320
 
 
 def test_refine_shows_sections_via_on_section_and_quit_aborts(monkeypatch):
