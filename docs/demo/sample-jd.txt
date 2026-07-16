@@ -1,0 +1,12 @@
+Senior Generative AI Engineer — Fintech
+
+We're building LLM-powered agents for financial workflows. You'll own agentic
+systems end to end: RAG pipelines, multi-agent orchestration, and production MLOps.
+
+Must have:
+- 5+ years in ML/AI with strong Python
+- Hands-on LLM apps: RAG, agents, fine-tuning (LangGraph / LangChain / DSPy)
+- Production MLOps: feature stores, CI/CD, model serving, MLflow
+- Vector databases and LLM evaluation frameworks
+
+Nice to have: Kubernetes, Go or Java, ranking / recommendation systems.
