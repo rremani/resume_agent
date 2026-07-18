@@ -47,8 +47,10 @@ powershell -ExecutionPolicy Bypass -File start.ps1
 Open a new terminal and type `resume`. The first run walks you through setup and can
 build your knowledge base from an existing resume.
 
-**Requirements:** Python 3.10+ and an API key from [Anthropic](https://console.anthropic.com)
-or [OpenRouter](https://openrouter.ai) (kept in a git-ignored `.env`, never uploaded).
+**Requirements:** Python 3.10+ and an API key for a supported model provider —
+Anthropic, OpenAI, OpenRouter, Gemini, Groq, Mistral, DeepSeek, xAI, or a local
+Ollama (no key). Onboarding lets you pick from a menu; the key is kept in a
+git-ignored `.env`, never uploaded.
 
 ## Use it
 
@@ -124,11 +126,18 @@ One model is used for everything (fast and think differ only in whether they con
 Web research is on by default so `think` can understand the target.
 
 ```yaml
-provider: openrouter          # anthropic | openrouter
+provider: openrouter          # anthropic · openai · openrouter · gemini · groq · …
 model: google/gemini-3.5-flash
 allow_web: true
 search:                       # optional explicit search tool for research
   provider: tavily            # tavily | exa | brave | none
+```
+
+Model calls go through [LiteLLM](https://docs.litellm.ai), so you can point `model:`
+at **any** LiteLLM-supported provider — just set the matching API key in your `.env`:
+
+```yaml
+model: gemini/gemini-2.5-pro      # or groq/llama-3.1-70b, ollama/llama3, openai/gpt-4o, …
 ```
 
 ## Under the hood

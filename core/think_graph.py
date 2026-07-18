@@ -33,9 +33,8 @@ from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 
 from langgraph.graph import StateGraph, START, END
-from langchain_core.messages import SystemMessage, HumanMessage
 
-from . import store, compiler, paths, agent as core_agent, search as search_mod
+from . import store, compiler, paths, agent as core_agent, search as search_mod, llm
 
 MAX_GAP_QUESTIONS = 3  # don't interrogate — ask about the top few must-have gaps
 
@@ -163,24 +162,11 @@ experience — never alter or inflate a title (e.g. "Data Scientist" must not be
 Output the structured resume."""
 
 
-# ---- model builder ------------------------------------------------------
+# ---- model resolution ---------------------------------------------------
 
-# A full-resume structured-output JSON can exceed 4k tokens; too low a cap
-# truncates the JSON mid-object and the parser raises LengthFinishReasonError.
-MAX_OUTPUT_TOKENS = 8192
-
-
-def _build_model(cfg: dict, model_id: str, max_tokens: int = MAX_OUTPUT_TOKENS):
-    provider = (cfg.get("provider") or "anthropic").lower()
-    if provider == "anthropic":
-        from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(model=model_id, max_tokens=max_tokens)
-    if provider == "openrouter":
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model=model_id, max_tokens=max_tokens,
-                          base_url="https://openrouter.ai/api/v1",
-                          api_key=os.environ.get("OPENROUTER_API_KEY"))
-    raise ValueError(f"Unknown provider {provider!r}")
+def _model(cfg: dict) -> str:
+    """The LiteLLM model string for this config (provider + model → string)."""
+    return llm.to_model(cfg.get("provider", ""), cfg["model"])
 
 
 # ---- opening greeting (LLM-authored, background-aware) -----------------
@@ -212,28 +198,24 @@ def session_greeting(cfg: dict) -> str:
     """LLM-authored opening message, aware of the candidate's background. Hard-capped
     and truncated to 1-2 sentences; returns "" (→ static fallback) on a degenerate
     loop, so a rambling model can never flood the terminal."""
-    model = _build_model(cfg, cfg["model"], max_tokens=120)
-    msg = model.invoke([SystemMessage(content=GREET_SYSTEM),
-                        HumanMessage(content="Candidate background:\n" + wiki_summary()
-                                     + "\n\nWrite the opening greeting now.")])
-    content = getattr(msg, "content", msg)
-    if isinstance(content, list):   # some providers return content parts
-        content = " ".join(str(getattr(p, "text", p)) for p in content)
+    content = llm.chat(GREET_SYSTEM,
+                       "Candidate background:\n" + wiki_summary()
+                       + "\n\nWrite the opening greeting now.",
+                       model=_model(cfg), max_tokens=120)
     raw = " ".join(str(content).split())               # collapse whitespace/newlines
     text = " ".join(re.split(r"(?<=[.!?])\s+", raw)[:2]).strip()[:320]   # first 1-2 sentences
     return "" if _degenerate(text) else text
 
 
-# ---- LLM steps (module-level, testable with a stub model) --------------
+# ---- LLM steps (module-level, testable by stubbing llm.structured/chat) -
 
 def assess_jd(model, target: str, evidence: str) -> Assessment:
     """One call: analyze the target AND mark which requirements the wiki covers."""
-    user = [f"=== TARGET (role / job description) ===\n{target}",
-            f"=== CANDIDATE'S VERIFIED EXPERIENCE (the only basis for coverage) ===\n{evidence}",
-            "Analyze the target and assess coverage now."]
-    structured = model.with_structured_output(Assessment)
-    return structured.invoke([SystemMessage(content=ASSESS_SYSTEM),
-                              HumanMessage(content="\n\n".join(user))])
+    user = "\n\n".join([
+        f"=== TARGET (role / job description) ===\n{target}",
+        f"=== CANDIDATE'S VERIFIED EXPERIENCE (the only basis for coverage) ===\n{evidence}",
+        "Analyze the target and assess coverage now."])
+    return llm.structured(ASSESS_SYSTEM, user, Assessment, model=model)
 
 
 ESTIMATES_NOTE = ("=== ESTIMATES AUTHORIZED ===\nThe candidate has explicitly asked you "
@@ -259,9 +241,7 @@ def fill_resume(model, assessment: dict, evidence: str, provided: Optional[list]
     if allow_estimates:
         user.append(ESTIMATES_NOTE)
     user.append("Build the tailored resume now.")
-    structured = model.with_structured_output(Resume)
-    return structured.invoke([SystemMessage(content=FILL_SYSTEM),
-                              HumanMessage(content="\n\n".join(user))])
+    return llm.structured(FILL_SYSTEM, "\n\n".join(user), Resume, model=model)
 
 
 # ---- scoped section edits (only ever touch ONE section) ----------------
@@ -306,9 +286,8 @@ def edit_role_bullets(model, role: dict, feedback: str, evidence: str,
              f"=== VERIFIED EXPERIENCE (the only source of facts) ===\n{evidence}",
              f"=== CHANGE REQUESTED ===\n{feedback}",
              "Return the full revised bullet list for THIS role only."]
-    out = model.with_structured_output(Bullets).invoke(
-        [SystemMessage(content=EDIT_SECTION_SYSTEM),
-         HumanMessage(content=_edit_user(parts, allow_estimates))])
+    out = llm.structured(EDIT_SECTION_SYSTEM, _edit_user(parts, allow_estimates),
+                         Bullets, model=model)
     return [b.model_dump() for b in out.bullets]
 
 
@@ -318,9 +297,8 @@ def edit_summary(model, draft: dict, feedback: str, evidence: str,
              f"=== VERIFIED EXPERIENCE ===\n{evidence}",
              f"=== CHANGE REQUESTED ===\n{feedback}",
              "Return the revised summary."]
-    return model.with_structured_output(SummaryOut).invoke(
-        [SystemMessage(content=EDIT_SECTION_SYSTEM),
-         HumanMessage(content=_edit_user(parts, allow_estimates))]).summary
+    return llm.structured(EDIT_SECTION_SYSTEM, _edit_user(parts, allow_estimates),
+                          SummaryOut, model=model).summary
 
 
 def edit_skills(model, draft: dict, feedback: str, evidence: str,
@@ -330,9 +308,8 @@ def edit_skills(model, draft: dict, feedback: str, evidence: str,
              f"=== VERIFIED EXPERIENCE ===\n{evidence}",
              f"=== CHANGE REQUESTED ===\n{feedback}",
              "Return the revised skills."]
-    out = model.with_structured_output(SkillsOut).invoke(
-        [SystemMessage(content=EDIT_SECTION_SYSTEM),
-         HumanMessage(content=_edit_user(parts, allow_estimates))])
+    out = llm.structured(EDIT_SECTION_SYSTEM, _edit_user(parts, allow_estimates),
+                         SkillsOut, model=model)
     return [s.model_dump() for s in out.skills]
 
 
@@ -527,8 +504,6 @@ def run_think(cfg: dict, *, opening: str, out_stem: str, ask_fn, say_fn,
     on_section(title, body) is an optional render hook (the inline TUI) for the
     section menu / a single section as a titled panel; plain mode falls back to
     say_fn text."""
-    _cache = {}
-
     def emit(title: str, body: str):
         if on_section:
             on_section(title, body)
@@ -536,9 +511,7 @@ def run_think(cfg: dict, *, opening: str, out_stem: str, ask_fn, say_fn,
             say_fn(f"— {title} —\n{body}")
 
     def model():
-        if "m" not in _cache:
-            _cache["m"] = _build_model(cfg, cfg["model"])
-        return _cache["m"]
+        return _model(cfg)   # the LiteLLM model string (cheap; keys read from env)
 
     def understand(state: State) -> dict:
         target = (state.get("target") or "").strip()

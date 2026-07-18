@@ -113,12 +113,14 @@ def _ensure_wiki(cfg) -> bool:
         # onboarding), rather than bouncing to `resume bootstrap`.
         console.print("[yellow]No career wiki yet.[/] Let's build one from your "
                       "existing resume.")
-        key_present = bool(os.environ.get(_config.ENV_VAR[cfg["provider"]]))
+        env = _config.ENV_VAR.get(cfg["provider"])
+        key_present = (not env) or bool(os.environ.get(env))
         _config._maybe_bootstrap(cfg, key_present=key_present)
     else:
         # Sources exist but were never compiled → recompile, don't re-bootstrap.
         console.print("[yellow]Your raw sources aren't compiled into a wiki yet.[/]")
-        if not os.environ.get(_config.ENV_VAR[cfg["provider"]]):
+        env = _config.ENV_VAR.get(cfg["provider"])
+        if env and not os.environ.get(env):
             console.print("[dim]Set your API key, then run [bold]resume recompile[/].[/]")
         elif Prompt.ask("Compile them now?", default="y").strip().lower().startswith("y"):
             from core import compiler

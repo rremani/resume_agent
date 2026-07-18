@@ -13,7 +13,22 @@ import yaml
 
 from . import paths
 
-ENV_VAR = {"anthropic": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY"}
+# Model calls go through LiteLLM, so any LiteLLM provider works. These are the
+# common ones we offer by name (env var LiteLLM reads + a suggested model). Any
+# other provider works too — the user types a model string and its env var.
+ENV_VAR = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "xai": "XAI_API_KEY",
+    "ollama": "",           # local, no key
+}
+
+PROVIDERS = list(ENV_VAR)   # display order for onboarding
 
 
 def load_dotenv():
@@ -63,10 +78,17 @@ DEFAULTS = {
     "allow_web": True,
 }
 
-# Suggested model shown during onboarding, per provider.
+# Suggested model shown during onboarding, per provider (override anytime).
 SUGGESTED = {
     "anthropic": "claude-sonnet-4-6",
+    "openai": "gpt-4o",
     "openrouter": "google/gemini-3.5-flash",
+    "gemini": "gemini-2.5-flash",
+    "groq": "llama-3.3-70b-versatile",
+    "mistral": "mistral-large-latest",
+    "deepseek": "deepseek-chat",
+    "xai": "grok-2-latest",
+    "ollama": "llama3",
 }
 
 
@@ -96,83 +118,127 @@ def save_config(cfg):
         yaml.safe_dump(cfg, f, sort_keys=False)
 
 
+# ---- onboarding UI (Rich; light import, no LLM) ------------------------
+
+from rich.console import Console      # noqa: E402
+from rich.panel import Panel          # noqa: E402
+from rich.prompt import Prompt        # noqa: E402
+from rich.text import Text            # noqa: E402
+
+_c = Console()
+
+
+def _step(n: int, title: str, hint: str = ""):
+    _c.print()
+    _c.print(f"  [bold cyan]{n}[/][cyan]/4[/]  [bold]{title}[/]")
+    if hint:
+        _c.print(f"       [dim]{hint}[/]")
+
+
+def _ok(text):   _c.print(f"       [green]✓[/] {text}")
+def _skip(text): _c.print(f"       [dim]○ {text}[/]")
+def _warn(text): _c.print(f"       [yellow]⚠[/] {text}")
+
+
 def _ask(prompt, default=None):
-    try:
-        from rich.prompt import Prompt
-        return Prompt.ask(prompt, default=default) if default else Prompt.ask(prompt)
-    except Exception:
-        suffix = f" [{default}]" if default else ""
-        val = input(f"{prompt}{suffix}: ").strip()
-        return val or (default or "")
+    p = f"       [cyan]›[/] {prompt}"
+    return Prompt.ask(p, default=default) if default is not None else Prompt.ask(p)
+
+
+def _select(prompt, choices, default=None):
+    """An arrow-key select menu (questionary); falls back to a typed prompt when
+    there's no interactive terminal."""
+    import sys
+    choices = list(choices)
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            import questionary
+            ans = questionary.select(prompt, choices=choices, default=default,
+                                     qmark="›", instruction="(↑/↓ · enter)").ask()
+            return ans if ans is not None else (default or "")
+        except Exception:
+            pass
+    return _ask(f"{prompt} ({' / '.join(choices)})", default)
 
 
 def onboard():
-    print("\n=== Resume Agent — onboarding ===\n")
-    print("Choose your model provider.")
-    provider = ""
-    while provider not in ("anthropic", "openrouter"):
-        provider = _ask("Provider (anthropic / openrouter)", "anthropic").lower()
+    _c.print()
+    _c.print(Panel("[bold]Resume Agent[/]  ·  setup\n"
+                   "[dim]One model for everything. Your data stays on this machine.[/]",
+                   border_style="cyan", padding=(1, 3), expand=False))
 
-    sug = SUGGESTED[provider]
-    print("\nPick the model to use (one model for everything).")
-    print("  fast = one-shot · think = conversational — both use this model.\n")
-    model = _ask("Model", sug)
+    # 1 — provider & model
+    _step(1, "Model provider", "↑/↓ to choose — or 'other' for any LiteLLM provider")
+    _OTHER = "other…"
+    choice = _select("provider", PROVIDERS + [_OTHER], default="anthropic")
+    provider = (_ask("provider name (e.g. cohere, bedrock)", "") if choice == _OTHER
+                else choice).strip().lower()
+    sug = SUGGESTED.get(provider)
+    model = (_ask("model", sug) if sug
+             else _ask("model (LiteLLM name, e.g. gpt-4o or gemini-2.5-pro)"))
 
-    # --- API key → .env (never config.yaml) ---
-    env_var = ENV_VAR[provider]
-    print(f"\nAPI key (stored in a private .env file, not in config.yaml).")
-    if os.environ.get(env_var):
-        print(f"  {env_var} is already set in your environment.")
-    key = _ask(f"Paste your {env_var} (or leave blank to set it later)", "")
-    if key:
-        write_env_var(env_var, key)
-        print(f"  ✓ Saved to {paths.env_path()} (owner-only). Loaded automatically from now on.")
+    # 2 — API key
+    _step(2, "API key", "kept in a private .env (chmod 600), never in config.yaml")
+    env_var = ENV_VAR.get(provider)
+    if env_var is None:            # unknown provider — ask which env var holds its key
+        env_var = _ask("env var for the API key (blank if none)", "").strip()
+    if env_var:
+        if os.environ.get(env_var):
+            _ok(f"{env_var} is already set in your environment")
+        key = _ask(f"paste {env_var} (blank to set later)", "")
+        if key:
+            write_env_var(env_var, key)
+            _ok(f"saved to {paths.env_path()}")
+        else:
+            _skip(f"skipped — export {env_var} before running")
+        key_present = bool(key or os.environ.get(env_var))
     else:
-        print(f"  Skipped. Export {env_var} before running, or re-run onboarding.")
+        _skip("no API key needed for this provider")
+        key_present = True
 
-    cfg = {
-        "provider": provider,
-        "model": model,
-        "allow_web": True,
-    }
+    cfg = {"provider": provider, "model": model, "allow_web": True}
     _maybe_setup_search(cfg)
     save_config(cfg)
-    print(f"\n✓ Saved config to {paths.config_path()}")
-
-    # --- optional: bootstrap from an existing resume right now ---
-    _maybe_bootstrap(cfg, key_present=bool(key or os.environ.get(env_var)))
-
-    print("\nSetup complete. Generate any time with:")
-    print('  resume fast  "GenAI role at a bank, emphasize LLM + risk"')
-    print("  resume think --file jd.txt\n")
+    _maybe_bootstrap(cfg, key_present=key_present)
+    _summary(cfg)
     return cfg
 
 
-def _maybe_setup_search(cfg):
-    """Optionally enable an explicit web-search tool for think mode.
+def _summary(cfg):
+    body = Text()
+    body.append("You're all set.\n\n", style="bold")
+    for k in ("provider", "model"):
+        body.append(f"  {k:9}", style="dim"); body.append(f"{cfg.get(k, '')}\n")
+    body.append(f"  {'web':9}", style="dim")
+    body.append("on\n" if cfg.get("allow_web") else "off\n")
+    body.append("\n  Start any time:  ", style="dim")
+    body.append("resume", style="bold cyan")
+    _c.print()
+    _c.print(Panel(body, title="[green]✓ done[/]", title_align="left",
+                   border_style="green", padding=(1, 3), expand=False))
 
-    Provider name → config.yaml; the API key → git-ignored .env (never
-    config.yaml), mirroring the model-key flow above. Default 'none' keeps
-    think mode on the provider's built-in web search only."""
+
+def _maybe_setup_search(cfg):
+    """Optionally enable an explicit web-search tool for think mode. Provider name
+    → config.yaml; the API key → git-ignored .env (never config.yaml)."""
     from .search import SEARCH_PROVIDERS, SEARCH_ENV_VAR
-    print("\nOptional: an explicit, inspectable web-search tool for "
-          "[think] mode\n  (research a target company, pull a JD, verify a fact "
-          "before tailoring).")
-    print(f"  Providers: {', '.join(SEARCH_PROVIDERS)} — or 'none' to use only "
-          "the model provider's built-in web search.")
-    choice = _ask("Search provider (tavily / exa / brave / none)", "none").lower()
+    _step(3, "Web research (optional)",
+          "an inspectable search tool so `think` can research the target")
+    choice = _select("search provider", list(SEARCH_PROVIDERS) + ["none"],
+                     default="none").lower()
     if choice not in SEARCH_PROVIDERS:
+        _skip("no search tool — think uses the model's own knowledge")
         cfg["search"] = {"provider": "none"}
         return
     env_var = SEARCH_ENV_VAR[choice]
     if os.environ.get(env_var):
-        print(f"  {env_var} is already set in your environment.")
-    skey = _ask(f"Paste your {env_var} (or leave blank to set it later)", "")
+        _ok(f"{env_var} is already set in your environment")
+    skey = _ask(f"paste {env_var} (blank to set later)", "")
     if skey:
         write_env_var(env_var, skey)
-        print(f"  ✓ Saved {env_var} to {paths.env_path()} (owner-only).")
+        _ok(f"saved {env_var}")
     else:
-        print(f"  Skipped — export {env_var} or re-run onboarding before using it.")
+        _skip(f"skipped — export {env_var} before using it")
     cfg["search"] = {"provider": choice, "max_results": 3}
 
 
@@ -181,44 +247,43 @@ def _maybe_bootstrap(cfg, key_present: bool):
     from . import store
     if not store.raw_is_empty():
         return  # already have sources; don't re-bootstrap
-    print("\nBuild your career wiki from an existing resume now? (PDF, DOCX, etc.)")
-    path = _ask("Path to your resume (or leave blank to do it later)", "")
+    _step(4, "Import your resume (optional)",
+          "build your career knowledge base from an existing resume (PDF, DOCX…)")
+    path = _ask("path to your resume (blank to do it later)", "")
     if not path:
-        print("  Skipped. Run later with: resume bootstrap <your-resume>")
+        _skip("skipped — run later with:  resume bootstrap <your-resume>")
         return
     path = os.path.expanduser(path.strip())
     if not os.path.exists(path):
-        print(f"  File not found: {path}. Run later with: resume bootstrap <file>")
+        _warn(f"file not found: {path} — run later with: resume bootstrap <file>")
         return
     if not key_present:
-        print("  No API key available, so the wiki can't be compiled yet.")
-        print(f"  Your resume path is noted; run: resume bootstrap {path}")
+        _warn(f"no API key yet, so it can't compile — run later: resume bootstrap {path}")
         return
-    # Do the actual bootstrap (extract → raw → compile)
     from .extract import extract_to_markdown
     from . import ingest
     from .providers import make_provider
     try:
         text, method = extract_to_markdown(path)
     except Exception as e:
-        print(f"  Extraction failed ({e}). Run later with: resume bootstrap {path}")
+        _warn(f"extraction failed ({e}) — run later: resume bootstrap {path}")
         return
     if not text.strip():
-        print("  Could not extract text (scanned PDF?). Needs OCR; skipping for now.")
+        _warn("couldn't extract text (scanned PDF?) — needs OCR; skipping")
         return
-    print(f"  Extracted via {method}; compiling wiki with {cfg['model']}…")
-    try:
-        provider = make_provider(cfg["provider"])
-        res = ingest.bootstrap_from_text(provider, model=cfg["model"],
-                                         resume_text=text)
-        if res["ok"]:
-            print("  ✓ Career wiki compiled — every fact traces to your resume.")
-        else:
-            print("  ⚠ Wiki compiled with grounding flags to review:")
-            for p in res["problems"][:5]:
-                print("     -", p)
-    except Exception as e:
-        print(f"  Compile failed ({e}). You can retry: resume recompile")
+    with _c.status(f"[bold]Compiling your career wiki with {cfg['model']}…[/]", spinner="dots"):
+        try:
+            res = ingest.bootstrap_from_text(make_provider(cfg["provider"]),
+                                             model=cfg["model"], resume_text=text)
+        except Exception as e:
+            _warn(f"compile failed ({e}) — you can retry: resume recompile")
+            return
+    if res["ok"]:
+        _ok("career wiki compiled — every fact traces to your resume")
+    else:
+        _warn("compiled with grounding flags to review:")
+        for p in res["problems"][:5]:
+            _c.print(f"         [dim]- {p}[/]")
 
 
 def ensure_config():

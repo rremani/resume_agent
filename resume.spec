@@ -18,7 +18,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas, binaries, hiddenimports = [], [], []
 # Packages whose data files / dynamic imports must be bundled explicitly.
-for pkg in ("markitdown", "reportlab", "docx", "anthropic", "openai",
+for pkg in ("markitdown", "reportlab", "docx", "litellm", "langgraph",
             "magika", "pypdf", "prompt_toolkit"):
     try:
         d, b, h = collect_all(pkg)

@@ -1,13 +1,12 @@
 """Tests for the JD-driven tailoring workflow (core/think_graph).
 
-The full graph needs a live LLM, so these cover the deterministic pieces: routers,
-the assess/fill/edit steps (via a stub model), gap helpers, the preview, the model
-builder, provenance grounding, and the on_draft routing.
+The full graph needs a live LLM, so these cover the deterministic pieces plus the
+LLM steps with `core.llm` stubbed: routers, assess/fill/edit, gap helpers, sections,
+identity-lock, provenance grounding, greeting guards, and end-to-end flows.
 """
 import os
 import sys
 
-import pytest
 from langgraph.graph import END
 
 CORE_PARENT = os.path.dirname(os.path.dirname(__file__))
@@ -15,27 +14,32 @@ sys.path.insert(0, CORE_PARENT)
 from core import think_graph as tg, agent as core_agent  # noqa: E402
 
 
-# ---- stub model: with_structured_output(schema).invoke(...) -> fixed obj ----
+# ---- stub the unified model layer (core.llm) ---------------------------
 
-class _Structured:
-    def __init__(self, obj):
-        self.obj = obj
-        self.calls = []
-
-    def invoke(self, prompt):
-        self.calls.append(prompt)
-        return self.obj
-
-
-class StubModel:
-    def __init__(self, by_schema):
+class _LLMStub:
+    """structured() returns a fixed object per schema (recording the prompt);
+    chat() returns a fixed string."""
+    def __init__(self, by_schema, chat_text):
         self.by_schema = by_schema
-        self.structured = {}
+        self.chat_text = chat_text
+        self.calls = []                       # (system, user, schema)
 
-    def with_structured_output(self, schema):
-        s = _Structured(self.by_schema[schema])
-        self.structured[schema] = s
-        return s
+    def structured(self, system, user, schema, *, model, max_tokens=8192):
+        self.calls.append((system, user, schema))
+        return self.by_schema[schema]
+
+    def chat(self, system, user, *, model, max_tokens=4096):
+        return self.chat_text
+
+    def sent_for(self, schema):
+        return next(f"{s}\n{u}" for s, u, sc in self.calls if sc is schema)
+
+
+def _patch_llm(monkeypatch, by_schema=None, chat_text="Hi! What role are you targeting?"):
+    stub = _LLMStub(by_schema or {}, chat_text)
+    monkeypatch.setattr(tg.llm, "structured", stub.structured)
+    monkeypatch.setattr(tg.llm, "chat", stub.chat)
+    return stub
 
 
 # ---- routers ------------------------------------------------------------
@@ -55,15 +59,30 @@ def test_route_refine():
     assert tg._route_refine({"aborted": False}) == "finalize"
 
 
-# ---- assess step (JD analysis + coverage, one call) --------------------
+# ---- model string resolution -------------------------------------------
 
-def test_assess_reads_target_and_evidence():
+def test_model_string_resolution():
+    assert tg._model({"provider": "anthropic", "model": "claude-sonnet-4-6"}) \
+        == "anthropic/claude-sonnet-4-6"
+    assert tg._model({"provider": "openrouter", "model": "google/gemini-3.5-flash"}) \
+        == "openrouter/google/gemini-3.5-flash"
+    # any configured provider is prefixed (broadened support)
+    assert tg._model({"provider": "gemini", "model": "gemini-2.5-flash"}) == "gemini/gemini-2.5-flash"
+    assert tg._model({"provider": "groq", "model": "llama-3.3-70b"}) == "groq/llama-3.3-70b"
+    # a full LiteLLM model string passes through untouched
+    assert tg._model({"provider": "openrouter", "model": "groq/llama-3.1-70b"}) \
+        == "groq/llama-3.1-70b"
+
+
+# ---- assess step --------------------------------------------------------
+
+def test_assess_reads_target_and_evidence(monkeypatch):
     a = tg.Assessment(role_title="Data Architect",
                       requirements=[tg.Requirement(name="Kubernetes", covered=False)])
-    model = StubModel({tg.Assessment: a})
-    out = tg.assess_jd(model, target="Data Architect, GenAI", evidence="wiki bundle")
+    stub = _patch_llm(monkeypatch, {tg.Assessment: a})
+    out = tg.assess_jd("m", target="Data Architect, GenAI", evidence="wiki bundle")
     assert out.role_title == "Data Architect"
-    sent = str(model.structured[tg.Assessment].calls[0])
+    sent = stub.sent_for(tg.Assessment)
     assert "Data Architect, GenAI" in sent and "wiki bundle" in sent
 
 
@@ -85,15 +104,15 @@ def test_strategy_of_uses_covered_requirements():
     assert [t["name"] for t in s["themes"]] == ["Agentic AI"]   # gaps excluded
 
 
-# ---- fill step (stub model) --------------------------------------------
+# ---- fill step ----------------------------------------------------------
 
-def test_fill_uses_assessment_evidence_and_provided():
+def test_fill_uses_assessment_evidence_and_provided(monkeypatch):
     want = tg.Resume(name="Ada", experience=[tg.Job(role="Eng", company="Acme")])
-    model = StubModel({tg.Resume: want})
-    out = tg.fill_resume(model, assessment={"role_title": "LLM Eng"},
+    stub = _patch_llm(monkeypatch, {tg.Resume: want})
+    out = tg.fill_resume("m", assessment={"role_title": "LLM Eng"},
                          evidence="wiki bundle text", provided=["Kubernetes: ran prod clusters"])
     assert out.name == "Ada"
-    sent = str(model.structured[tg.Resume].calls[0])
+    sent = stub.sent_for(tg.Resume)
     assert "wiki bundle text" in sent and "LLM Eng" in sent and "Kubernetes" in sent
 
 
@@ -139,12 +158,13 @@ def test_apply_section_edit_drop_is_deterministic_and_local():
     assert _DRAFT["experience"][0]["bullets"][0]["text"] == "Built X"  # input not mutated
 
 
-def test_apply_section_edit_wording_calls_llm_scoped_to_role():
-    model = StubModel({tg.Bullets: tg.Bullets(bullets=[tg.Bullet(text="Built X, at scale")])})
-    out = tg.apply_section_edit(model, _DRAFT, ("exp", 0), "tighten and add scale", evidence="ev")
+def test_apply_section_edit_wording_calls_llm_scoped_to_role(monkeypatch):
+    stub = _patch_llm(monkeypatch,
+                      {tg.Bullets: tg.Bullets(bullets=[tg.Bullet(text="Built X, at scale")])})
+    out = tg.apply_section_edit("m", _DRAFT, ("exp", 0), "tighten and add scale", evidence="ev")
     assert [b["text"] for b in out["experience"][0]["bullets"]] == ["Built X, at scale"]
     assert out["experience"][1]["bullets"] == [{"text": "Made W"}]   # other role safe
-    sent = str(model.structured[tg.Bullets].calls[0])
+    sent = stub.sent_for(tg.Bullets)
     assert "Eng — Acme" in sent and "tighten and add scale" in sent
 
 
@@ -173,20 +193,11 @@ def test_authorizes_estimates():
 
 def test_fill_locks_role_title_end_to_end(monkeypatch, tmp_path):
     monkeypatch.setenv("RESUME_AGENT_HOME", str(tmp_path))
-
-    class _Struct:
-        def __init__(self, o): self.o = o
-        def invoke(self, p): return self.o
-
-    class _Stub:
-        def with_structured_output(self, schema):
-            if schema is tg.Assessment:
-                return _Struct(tg.Assessment(role_title="T", requirements=[]))
-            return _Struct(tg.Resume(name="Ada", experience=[tg.Job(
-                role="Lead Data Scientist (GenAI Lead)", company="SAAL.AI",
-                bullets=[tg.Bullet(text="b")])]))
-
-    monkeypatch.setattr(tg, "_build_model", lambda cfg, mid: _Stub())
+    _patch_llm(monkeypatch, {
+        tg.Assessment: tg.Assessment(role_title="T", requirements=[]),
+        tg.Resume: tg.Resume(name="Ada", experience=[tg.Job(
+            role="Lead Data Scientist (GenAI Lead)", company="SAAL.AI",
+            bullets=[tg.Bullet(text="b")])])})
     monkeypatch.setattr(tg.compiler, "wiki_to_resume_yaml", lambda: {
         "name": "Ada", "skills": [],
         "experience": [{"role": "Data Scientist", "company": "SAAL.AI",
@@ -213,7 +224,7 @@ def test_strategy_text_from_assessment():
     assert "K8s" not in t   # gaps aren't part of the strategy
 
 
-# ---- grounding: dash-retitle + project-evidence + provenance -----------
+# ---- grounding ----------------------------------------------------------
 
 def test_grounding_tolerates_dash_retitle():
     store = {"experience": [{"company": "Vogo", "role": "Senior Engineer - Machine Learning"}]}
@@ -233,16 +244,7 @@ def test_grounding_allows_numbers_from_project_evidence():
     assert ok1 and not problems
 
 
-# ---- model builder + schema --------------------------------------------
-
-def test_build_model_selects_provider(monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test")
-    assert type(tg._build_model({"provider": "anthropic"}, "claude-sonnet-4-6")).__name__ == "ChatAnthropic"
-    assert type(tg._build_model({"provider": "openrouter"}, "google/gemini-3.5-flash")).__name__ == "ChatOpenAI"
-    with pytest.raises(ValueError):
-        tg._build_model({"provider": "nope"}, "x")
-
+# ---- greeting -----------------------------------------------------------
 
 def test_wiki_summary_and_session_greeting(monkeypatch):
     monkeypatch.setattr(tg.compiler, "wiki_to_resume_yaml",
@@ -251,13 +253,7 @@ def test_wiki_summary_and_session_greeting(monkeypatch):
     s = tg.wiki_summary()
     assert "Data Scientist" in s and "ML & GenAI" in s
 
-    class _Msg:
-        content = "Welcome back! What role are you targeting?"
-
-    class _Stub:
-        def invoke(self, msgs): return _Msg()
-
-    monkeypatch.setattr(tg, "_build_model", lambda *a, **k: _Stub())
+    monkeypatch.setattr(tg.llm, "chat", lambda *a, **k: "Welcome back! What role are you targeting?")
     g = tg.session_greeting({"provider": "anthropic", "model": "x"})
     assert "What role" in g
 
@@ -265,38 +261,23 @@ def test_wiki_summary_and_session_greeting(monkeypatch):
 def test_session_greeting_guards_against_runaway_loops(monkeypatch):
     monkeypatch.setattr(tg.compiler, "wiki_to_resume_yaml",
                         lambda: {"experience": [], "skills": []})
-
-    def stub(content):
-        msg = type("M", (), {"content": content})()
-        model = type("S", (), {"invoke": lambda self, m: msg})()
-        return lambda *a, **k: model
-
     # a repetition blob (no sentence breaks) → degenerate → "" (static fallback)
-    monkeypatch.setattr(tg, "_build_model", stub("share the job description " * 60))
+    monkeypatch.setattr(tg.llm, "chat", lambda *a, **k: "share the job description " * 60)
     assert tg.session_greeting({"provider": "anthropic", "model": "x"}) == ""
-
     # good opening that then loops → keep the first 1-2 sentences, stay short
-    monkeypatch.setattr(tg, "_build_model",
-                        stub("Hi! What role are you targeting? " + "Please share it. " * 60))
+    monkeypatch.setattr(tg.llm, "chat",
+                        lambda *a, **k: "Hi! What role are you targeting? " + "Please share it. " * 60)
     g = tg.session_greeting({"provider": "anthropic", "model": "x"})
     assert g.startswith("Hi! What role are you targeting?") and len(g) <= 320
 
 
+# ---- end-to-end flows (llm stubbed) ------------------------------------
+
 def test_refine_shows_sections_via_on_section_and_quit_aborts(monkeypatch):
-    """refine renders the strategy + section menu through on_section, and 'quit'
-    at the menu aborts without generating."""
-    class _Struct:
-        def __init__(self, obj): self.obj = obj
-        def invoke(self, p): return self.obj
-
-    class _Stub:
-        def with_structured_output(self, schema):
-            if schema is tg.Assessment:      # no gaps → convo passes straight through
-                return _Struct(tg.Assessment(role_title="T", requirements=[]))
-            return _Struct(tg.Resume(name="Ada", experience=[
-                tg.Job(role="E", company="C", bullets=[tg.Bullet(text="did X")])]))
-
-    monkeypatch.setattr(tg, "_build_model", lambda cfg, mid: _Stub())
+    _patch_llm(monkeypatch, {
+        tg.Assessment: tg.Assessment(role_title="T", requirements=[]),  # no gaps
+        tg.Resume: tg.Resume(name="Ada", experience=[
+            tg.Job(role="E", company="C", bullets=[tg.Bullet(text="did X")])])})
     monkeypatch.setattr(tg.compiler, "wiki_to_resume_yaml",
                         lambda: {"experience": [], "skills": []})
     monkeypatch.setattr(tg.store, "read_career_bundle", lambda: "wiki bundle")
@@ -305,12 +286,9 @@ def test_refine_shows_sections_via_on_section_and_quit_aborts(monkeypatch):
     res = tg.run_think(
         {"provider": "anthropic", "model": "x"},
         opening="a sufficiently long target brief so understand skips its question",
-        out_stem="t",
-        ask_fn=lambda: "quit",              # quit at the section menu
-        say_fn=lambda t: None,
-        notify_fn=lambda t: None,
-        render_fn=lambda d, s: ("d", "p"),
-        allow_web=False,
+        out_stem="t", ask_fn=lambda: "quit",       # quit at the section menu
+        say_fn=lambda t: None, notify_fn=lambda t: None,
+        render_fn=lambda d, s: ("d", "p"), allow_web=False,
         on_section=lambda title, body: shown.append((title, body)))
 
     assert res["aborted"] is True
@@ -321,32 +299,20 @@ def test_refine_shows_sections_via_on_section_and_quit_aborts(monkeypatch):
 
 
 def test_gap_conversation_collects_provided_and_finalizes(monkeypatch, tmp_path):
-    """End-to-end: a must-have gap is surfaced, the convo gathers the user's real
-    answer, and it flows through to finalize as session 'provided' provenance."""
     monkeypatch.setenv("RESUME_AGENT_HOME", str(tmp_path))
-
-    class _Struct:
-        def __init__(self, o): self.o = o
-        def invoke(self, p): return self.o
-
-    class _Stub:
-        def with_structured_output(self, schema):
-            if schema is tg.Assessment:
-                return _Struct(tg.Assessment(role_title="LLM Eng", requirements=[
-                    tg.Requirement(name="Kubernetes", importance="must", covered=False)]))
-            return _Struct(tg.Resume(name="Ada", experience=[tg.Job(role="E", company="C")]))
-
-    monkeypatch.setattr(tg, "_build_model", lambda cfg, mid: _Stub())
+    _patch_llm(monkeypatch, {
+        tg.Assessment: tg.Assessment(role_title="LLM Eng", requirements=[
+            tg.Requirement(name="Kubernetes", importance="must", covered=False)]),
+        tg.Resume: tg.Resume(name="Ada", experience=[tg.Job(role="E", company="C")])})
     monkeypatch.setattr(tg.compiler, "wiki_to_resume_yaml", lambda: {"experience": [], "skills": []})
     monkeypatch.setattr(tg.store, "read_career_bundle", lambda: "wiki bundle")
 
-    answers = iter(["yes, ran prod k8s clusters at Acme", "done"])  # gap answer, then generate
+    answers = iter(["yes, ran prod k8s clusters at Acme", "done"])   # gap answer, then generate
     says = []
     res = tg.run_think(
         {"provider": "anthropic", "model": "x"},
         opening="a sufficiently long target brief so understand skips its question",
-        out_stem="t",
-        ask_fn=lambda: next(answers),
+        out_stem="t", ask_fn=lambda: next(answers),
         say_fn=says.append, notify_fn=lambda t: None,
         render_fn=lambda d, s: ("d.docx", "p.pdf"), allow_web=False)
 
@@ -357,20 +323,10 @@ def test_gap_conversation_collects_provided_and_finalizes(monkeypatch, tmp_path)
 
 
 def test_assess_reports_no_gaps_when_covered(monkeypatch):
-    """When the wiki covers everything, the agent SAYS so — the gap analysis is
-    visible even with nothing to fill."""
-    class _Struct:
-        def __init__(self, o): self.o = o
-        def invoke(self, p): return self.o
-
-    class _Stub:
-        def with_structured_output(self, schema):
-            if schema is tg.Assessment:
-                return _Struct(tg.Assessment(role_title="T", requirements=[
-                    tg.Requirement(name="GenAI", importance="must", covered=True)]))
-            return _Struct(tg.Resume(name="Ada", experience=[tg.Job(role="E", company="C")]))
-
-    monkeypatch.setattr(tg, "_build_model", lambda cfg, mid: _Stub())
+    _patch_llm(monkeypatch, {
+        tg.Assessment: tg.Assessment(role_title="T", requirements=[
+            tg.Requirement(name="GenAI", importance="must", covered=True)]),
+        tg.Resume: tg.Resume(name="Ada", experience=[tg.Job(role="E", company="C")])})
     monkeypatch.setattr(tg.compiler, "wiki_to_resume_yaml", lambda: {"experience": [], "skills": []})
     monkeypatch.setattr(tg.store, "read_career_bundle", lambda: "wiki")
 
@@ -384,21 +340,11 @@ def test_assess_reports_no_gaps_when_covered(monkeypatch):
 
 
 def test_quality_gaps_are_reported_and_asked(monkeypatch):
-    """A resume-quality weakness (missing metrics) is surfaced AND the convo asks
-    the user for the real numbers — even when JD coverage is complete."""
-    class _Struct:
-        def __init__(self, o): self.o = o
-        def invoke(self, p): return self.o
-
-    class _Stub:
-        def with_structured_output(self, schema):
-            if schema is tg.Assessment:
-                return _Struct(tg.Assessment(role_title="T",
-                    requirements=[tg.Requirement(name="GenAI", covered=True)],
-                    quality_gaps=["The DSPy insights work states 'measurable gains' but no metric"]))
-            return _Struct(tg.Resume(name="Ada", experience=[tg.Job(role="E", company="C")]))
-
-    monkeypatch.setattr(tg, "_build_model", lambda cfg, mid: _Stub())
+    _patch_llm(monkeypatch, {
+        tg.Assessment: tg.Assessment(role_title="T",
+            requirements=[tg.Requirement(name="GenAI", covered=True)],
+            quality_gaps=["The DSPy insights work states 'measurable gains' but no metric"]),
+        tg.Resume: tg.Resume(name="Ada", experience=[tg.Job(role="E", company="C")])})
     monkeypatch.setattr(tg.compiler, "wiki_to_resume_yaml", lambda: {"experience": [], "skills": []})
     monkeypatch.setattr(tg.store, "read_career_bundle", lambda: "wiki")
 
@@ -415,26 +361,16 @@ def test_quality_gaps_are_reported_and_asked(monkeypatch):
 
 
 def test_refine_drop_preserves_other_roles_end_to_end(monkeypatch, tmp_path):
-    """The bug this fixes: dropping a bullet in one role used to delete whole other
-    roles. Now an edit is section-scoped, so B and C survive."""
+    """Dropping a bullet in one role used to delete whole other roles. Now an edit is
+    section-scoped, so B and C survive."""
     monkeypatch.setenv("RESUME_AGENT_HOME", str(tmp_path))
-
-    class _Struct:
-        def __init__(self, o): self.o = o
-        def invoke(self, p): return self.o
-
     resume = tg.Resume(name="Ada", experience=[
         tg.Job(role="A", company="X", bullets=[tg.Bullet(text="a1"), tg.Bullet(text="a2"), tg.Bullet(text="a3")]),
         tg.Job(role="B", company="Y", bullets=[tg.Bullet(text="b1"), tg.Bullet(text="b2")]),
         tg.Job(role="C", company="Z", bullets=[tg.Bullet(text="c1")])])
-
-    class _Stub:
-        def with_structured_output(self, schema):
-            if schema is tg.Assessment:
-                return _Struct(tg.Assessment(role_title="T", requirements=[]))
-            return _Struct(resume)
-
-    monkeypatch.setattr(tg, "_build_model", lambda cfg, mid: _Stub())
+    _patch_llm(monkeypatch, {
+        tg.Assessment: tg.Assessment(role_title="T", requirements=[]),
+        tg.Resume: resume})
     monkeypatch.setattr(tg.compiler, "wiki_to_resume_yaml", lambda: {"experience": [], "skills": []})
     monkeypatch.setattr(tg.store, "read_career_bundle", lambda: "wiki")
 
