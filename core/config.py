@@ -245,10 +245,14 @@ def _maybe_setup_search(cfg):
 def _maybe_bootstrap(cfg, key_present: bool):
     """Offer to build the career wiki from an existing resume during onboarding."""
     from . import store
-    if not store.raw_is_empty():
-        return  # already have sources; don't re-bootstrap
-    _step(4, "Import your resume (optional)",
+    _step(4, "Import your resume",
           "build your career knowledge base from an existing resume (PDF, DOCX…)")
+    if not store.raw_is_empty():
+        import glob
+        n = len(glob.glob(os.path.join(paths.raw_dir(), "*.md")))
+        _ok(f"you already have a career wiki ({n} source{'s' if n != 1 else ''}) — nothing to import")
+        _skip('add more anytime with:  resume add "…"   (or /add in the chat)')
+        return
     path = _ask("path to your resume (blank to do it later)", "")
     if not path:
         _skip("skipped — run later with:  resume bootstrap <your-resume>")

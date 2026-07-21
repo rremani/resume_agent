@@ -322,6 +322,40 @@ def test_gap_conversation_collects_provided_and_finalizes(monkeypatch, tmp_path)
     assert any("look thin" in s for s in says)               # coverage reported
 
 
+def test_is_clarifying():
+    for q in ["what do you mean by data modelling?", "what is A/B testing",
+              "can you explain", "idk", "not sure what that is", "huh?"]:
+        assert tg.is_clarifying(q), q
+    for a in ["yes I ran A/B tests at Acme", "no", "built data models for 3 years"]:
+        assert not tg.is_clarifying(a), a
+
+
+def test_convo_explains_a_term_then_accepts_the_answer(monkeypatch, tmp_path):
+    """When the user asks what a requirement means, the agent explains it and
+    re-asks the SAME short question instead of storing the question as an answer."""
+    monkeypatch.setenv("RESUME_AGENT_HOME", str(tmp_path))
+    _patch_llm(monkeypatch, {
+        tg.Assessment: tg.Assessment(role_title="T", requirements=[
+            tg.Requirement(name="data modeling", question="Have you designed data models?",
+                           importance="must", covered=False)]),
+        tg.Resume: tg.Resume(name="Ada", experience=[tg.Job(role="E", company="C")])},
+        chat_text="Data modeling means structuring data into tables, e.g. a star schema.")
+    monkeypatch.setattr(tg.compiler, "wiki_to_resume_yaml", lambda: {"experience": [], "skills": []})
+    monkeypatch.setattr(tg.store, "read_career_bundle", lambda: "wiki")
+
+    answers = iter(["what do you mean?", "yes, built star schemas at Acme", "done"])
+    says = []
+    res = tg.run_think({"provider": "anthropic", "model": "x"},
+                       opening="a sufficiently long target brief so understand skips its question",
+                       out_stem="t", ask_fn=lambda: next(answers),
+                       say_fn=says.append, notify_fn=lambda t: None,
+                       render_fn=lambda d, s: ("d", "p"), allow_web=False)
+    assert res["aborted"] is False
+    assert any("star schema" in s for s in says)                     # it explained the term
+    assert sum("Have you designed data models?" in s for s in says) >= 2  # asked, then re-asked
+    assert res["provided"] == ["data modeling: yes, built star schemas at Acme"]
+
+
 def test_assess_reports_no_gaps_when_covered(monkeypatch):
     _patch_llm(monkeypatch, {
         tg.Assessment: tg.Assessment(role_title="T", requirements=[

@@ -1,6 +1,6 @@
 [project]
 name = "resume-agent"
-version = "0.38.0"
+version = "0.40.0"
 description = "Terminal agent that generates tailored, FAANG-style resumes from a read-only career store."
 requires-python = ">=3.10"
 dependencies = [

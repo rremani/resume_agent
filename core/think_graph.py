@@ -92,6 +92,7 @@ class Resume(BaseModel):
 
 class Requirement(BaseModel):
     name: str
+    question: str = ""           # short, plain-language yes/no question for the gap convo
     importance: str = "must"     # "must" | "nice"
     covered: bool = False        # does the candidate's VERIFIED experience evidence it?
     evidence: str = ""           # brief note on the supporting evidence, or "" if a gap
@@ -115,10 +116,13 @@ EXPERIENCE (their career wiki), do THREE things:
 1) Analyze the target. What must a resume DEMONSTRATE to get SHORTLISTED for THIS \
 role? Extract role_title, company, seniority, the ATS keywords that matter, and a \
 shortlist-oriented summary_angle.
-2) List the key requirements (mark each importance "must" or "nice"). For each, \
-judge from the VERIFIED EXPERIENCE ONLY whether the candidate COVERS it \
-(covered=true, with a short evidence note) or NOT (covered=false → a gap). Do not \
-assume coverage that the evidence doesn't show.
+2) List the key requirements. Keep each `name` CONCISE (≤ 6 words, no parenthetical \
+lists — split a compound requirement into separate ones). Mark each importance "must" \
+or "nice". For each, judge from the VERIFIED EXPERIENCE ONLY whether the candidate \
+COVERS it (covered=true, with a short evidence note) or NOT (covered=false → a gap); \
+don't assume coverage the evidence doesn't show. Also write `question`: ONE short, \
+plain-language question (≤ 12 words, NO jargon) that asks whether they've done that one \
+thing — e.g. "Have you run A/B tests or experiments?", "Have you designed data models?".
 3) Review the experience against strong-resume BEST PRACTICES and fill `quality_gaps` \
 with the most impactful weaknesses to fix (at most 5). The #1 check: accomplishments \
 stated WITHOUT quantified impact — no %, count, scale, or before/after — that \
@@ -198,10 +202,12 @@ def session_greeting(cfg: dict) -> str:
     """LLM-authored opening message, aware of the candidate's background. Hard-capped
     and truncated to 1-2 sentences; returns "" (→ static fallback) on a degenerate
     loop, so a rambling model can never flood the terminal."""
+    # Enough tokens for reasoning models to finish thinking AND emit the greeting;
+    # the truncation + degeneracy guard below still cap what's displayed.
     content = llm.chat(GREET_SYSTEM,
                        "Candidate background:\n" + wiki_summary()
                        + "\n\nWrite the opening greeting now.",
-                       model=_model(cfg), max_tokens=120)
+                       model=_model(cfg), max_tokens=1024)
     raw = " ".join(str(content).split())               # collapse whitespace/newlines
     text = " ".join(re.split(r"(?<=[.!?])\s+", raw)[:2]).strip()[:320]   # first 1-2 sentences
     return "" if _degenerate(text) else text
@@ -216,6 +222,34 @@ def assess_jd(model, target: str, evidence: str) -> Assessment:
         f"=== CANDIDATE'S VERIFIED EXPERIENCE (the only basis for coverage) ===\n{evidence}",
         "Analyze the target and assess coverage now."])
     return llm.structured(ASSESS_SYSTEM, user, Assessment, model=model)
+
+
+# ---- gap conversation: explain a term, detect a clarifying question -----
+
+EXPLAIN_SYSTEM = ("You are a friendly, concise career coach. Explain the given resume/JD "
+                  "requirement in 1-2 plain sentences with a quick concrete example, so a "
+                  "non-expert can tell whether they've done it. No jargon, no preamble, and "
+                  "do NOT ask a question back.")
+
+_QUESTION_RE = re.compile(
+    r"^\s*(what'?s?|how|why|which|when|who|can you|could you|explain|meaning|define|idk|"
+    r"dunno|unsure|not sure|no idea|i (don'?t|do not) (know|understand|get)|elaborate|"
+    r"example|examples|clarify|huh|tell me more)\b", re.I)
+
+
+def is_clarifying(text: str) -> bool:
+    """True when the user is asking us to explain, not answering the question."""
+    t = (text or "").strip()
+    return t.endswith("?") or bool(_QUESTION_RE.match(t))
+
+
+def explain_term(model, term: str) -> str:
+    # Generous max_tokens: reasoning models (GLM, o1, R1…) spend tokens THINKING
+    # before emitting content, so a tight cap returns an empty answer.
+    out = llm.chat(EXPLAIN_SYSTEM, f"Explain in plain terms: {term}",
+                   model=model, max_tokens=1200)
+    return out or (f"(couldn't fetch a clear explanation of \"{term}\" just now — if "
+                   "you're unsure whether you've done it, just say 'skip')")
 
 
 ESTIMATES_NOTE = ("=== ESTIMATES AUTHORIZED ===\nThe candidate has explicitly asked you "
@@ -564,23 +598,32 @@ def run_think(cfg: dict, *, opening: str, out_stem: str, ask_fn, say_fn,
         a = state["assessment"]
         provided, estimates = [], False
         _NO = ("no", "n", "skip", "none", "nope", "")
-        # 1) JD must-have gaps — honest, one at a time, capped. Guard bare answers.
+        # 1) JD must-have gaps — one short question at a time. If the user is
+        #    confused, explain the term and re-ask (a real back-and-forth).
         for g in gaps_of(a, must_only=True)[:MAX_GAP_QUESTIONS]:
-            say_fn(f"Do you have real experience with \"{g['name']}\"? "
-                   "Describe briefly, or say 'no' / 'skip'.")
-            ans = (ask_fn() or "").strip()
-            low = ans.lower()
-            if low in ("quit", "exit", "cancel"):
-                return {"aborted": True}
-            if low in _NO:
-                continue
-            if low in ("yes", "yeah", "yep", "y", "sure") or len(ans.split()) < 3:
-                say_fn(f"Got it — briefly, what did you build or do with {g['name']}? "
-                       "(or 'skip' to leave it out)")
+            q = (g.get("question") or f"Have you worked with {g['name']}?").strip()
+            say_fn(q + "   (or 'no' / 'skip')")
+            clar = 0
+            while True:
                 ans = (ask_fn() or "").strip()
-                if ans.lower() in _NO + ("quit", "exit", "cancel"):
+                low = ans.lower()
+                if low in ("quit", "exit", "cancel"):
+                    return {"aborted": True}
+                if low in _NO:
+                    break                                    # skip this requirement
+                if is_clarifying(ans) and clar < 2:          # they asked, not answered
+                    clar += 1
+                    notify_fn("one sec…")
+                    say_fn(explain_term(model(), g["name"]))
+                    say_fn(q + "   (or 'skip')")
                     continue
-            provided.append(f"{g['name']}: {ans}")
+                if low in ("yes", "yeah", "yep", "y", "sure") or len(ans.split()) < 3:
+                    say_fn("Got it — briefly, what did you do? (or 'skip')")
+                    ans = (ask_fn() or "").strip()
+                    if ans.lower() in _NO + ("quit", "exit", "cancel"):
+                        break
+                provided.append(f"{g['name']}: {ans}")
+                break
         # 2) Quality gaps — one short ask; the user may share real numbers OR
         #    explicitly authorize estimates ("you decide / fill them in").
         quality = a.get("quality_gaps") or []

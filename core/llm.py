@@ -56,10 +56,20 @@ def _messages(system: str, user: str) -> list:
             {"role": "user", "content": user}]
 
 
+def _opts(model: str) -> dict:
+    """Turn OFF reasoning/thinking so reasoning models (GLM, deepseek-r1, …) answer
+    DIRECTLY — faster, cheaper, and their `content` isn't left empty while they
+    think. OpenRouter exposes this via the `reasoning` control; other providers
+    aren't reasoning-by-default, so nothing is added."""
+    if model.startswith("openrouter/"):
+        return {"extra_body": {"reasoning": {"enabled": False}}}
+    return {}
+
+
 def chat(system: str, user: str, *, model: str, max_tokens: int = 4096) -> str:
     """A plain-text completion. `model` is a LiteLLM model string."""
     resp = _lm().completion(model=model, messages=_messages(system, user),
-                            max_tokens=max_tokens)
+                            max_tokens=max_tokens, **_opts(model))
     return (resp.choices[0].message.content or "").strip()
 
 
@@ -77,6 +87,6 @@ def structured(system: str, user: str, schema, *, model: str, max_tokens: int = 
     Uses LiteLLM's response_format so capable providers enforce the JSON schema;
     a fenced/whitespace-wrapped reply is tolerated before validation."""
     resp = _lm().completion(model=model, messages=_messages(system, user),
-                            max_tokens=max_tokens, response_format=schema)
+                            max_tokens=max_tokens, response_format=schema, **_opts(model))
     content = _extract_json(resp.choices[0].message.content)
     return schema.model_validate(json.loads(content))
